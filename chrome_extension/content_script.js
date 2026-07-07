@@ -571,6 +571,154 @@ function clearOldMarks() {
   document.querySelectorAll(".geo-keyword-mark").forEach((node) => node.remove());
 }
 
+
+/**
+ * DOM精准关键词定位模块
+ * 不依赖OCR：
+ * 1. 在AI回答DOM中查找关键词
+ * 2. 获取关键词前后15个字符上下文
+ * 3. 使用Range获取真实浏览器坐标
+ * 4. 自动滚动居中并绘制标记框
+ */
+
+function normalizeKeywordText(text) {
+  return String(text || "")
+    .replace(/\s+/g, "")
+    .replace(/[，。！？、,.!?]/g, "");
+}
+
+function getKeywordContext(text, start, length, size = 15) {
+  const begin = Math.max(0, start - size);
+  const end = Math.min(text.length, start + length + size);
+  return text.slice(begin, end);
+}
+
+function findKeywordRangeInDOM(root, keyword) {
+  if (!root || !keyword) return null;
+
+  const walker = document.createTreeWalker(
+    root,
+    NodeFilter.SHOW_TEXT
+  );
+
+  const keywordNormalized = normalizeKeywordText(keyword);
+
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    const raw = node.nodeValue || "";
+    const normalized = normalizeKeywordText(raw);
+
+    const index = normalized.indexOf(keywordNormalized);
+
+    if (index >= 0) {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      return {
+        range,
+        node,
+        context: getKeywordContext(
+          raw,
+          Math.max(0, index),
+          keyword.length
+        )
+      };
+    }
+  }
+
+  return null;
+}
+
+
+function drawDOMKeywordBox(range) {
+  document.querySelectorAll(".geo-dom-keyword-mark")
+    .forEach((item) => item.remove());
+
+  const rects = Array.from(range.getClientRects())
+    .filter(rect => rect.width > 0 && rect.height > 0);
+
+  rects.forEach(rect => {
+    const box = document.createElement("div");
+
+    box.className = "geo-dom-keyword-mark";
+
+    Object.assign(box.style, {
+      position: "absolute",
+      left: `${rect.left + window.scrollX - 6}px`,
+      top: `${rect.top + window.scrollY - 6}px`,
+      width: `${rect.width + 12}px`,
+      height: `${rect.height + 12}px`,
+      border: "3px solid red",
+      zIndex: "2147483647",
+      pointerEvents: "none",
+      boxSizing: "border-box"
+    });
+
+    document.documentElement.appendChild(box);
+  });
+}
+
+
+async function locateKeywordByDOM(keywords, root = GEO_LAST_ANSWER_ELEMENT) {
+
+  const keywordList = splitKeywords(keywords);
+
+  const targetRoot =
+    root && document.body.contains(root)
+      ? root
+      : document.body;
+
+
+  for (const keyword of keywordList) {
+
+    const result = findKeywordRangeInDOM(
+      targetRoot,
+      keyword
+    );
+
+    if (result) {
+
+      const rect =
+        result.range.getBoundingClientRect();
+
+
+      window.scrollTo({
+        top:
+          window.scrollY +
+          rect.top -
+          window.innerHeight / 2,
+        behavior: "smooth"
+      });
+
+
+      await sleep(800);
+
+
+      drawDOMKeywordBox(
+        result.range
+      );
+
+
+      return {
+        matched: true,
+        keyword,
+        context: result.context,
+        rect: {
+          x: rect.x,
+          y: rect.y,
+          width: rect.width,
+          height: rect.height
+        }
+      };
+    }
+  }
+
+
+  return {
+    matched: false
+  };
+}
+
+
 function markKeywords(keywords, root = GEO_LAST_ANSWER_ELEMENT || document.body) {
   clearOldMarks();
   const keywordList = splitKeywords(keywords);
@@ -696,8 +844,19 @@ async function runPlatformTask(task) {
   }
 
   if (matched) {
-    markKeywords(matchedKeywords, GEO_LAST_ANSWER_ELEMENT);
+
+    // 优先使用DOM真实坐标定位，OCR作为备用
+    const domResult = await locateKeywordByDOM(
+      matchedKeywords,
+      GEO_LAST_ANSWER_ELEMENT
+    );
+
+    if (!domResult.matched) {
+      markKeywords(matchedKeywords, GEO_LAST_ANSWER_ELEMENT);
+    }
+
     await sleep(1200);
+
   } else {
     clearOldMarks();
     scrollToAnswerElement(GEO_LAST_ANSWER_ELEMENT);
