@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Node
+node_modules/
+
+# 环境变量
+.env
+
+# mac
+.DS_Store
+
+# 输出文件
+output/
+
+# 浏览器缓存
+*.log
+
+# 登录信息
+cookie*
+session*
+*.json

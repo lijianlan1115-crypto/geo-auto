@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <style>
+      body { width: 320px; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 14px; color: #202124; }
+      h1 { font-size: 16px; margin: 0 0 12px; }
+      label { display: block; font-size: 12px; color: #5f6368; margin: 10px 0 4px; }
+      input { box-sizing: border-box; width: 100%; padding: 8px; border: 1px solid #dadce0; border-radius: 6px; }
+      .row { display: flex; gap: 8px; margin-top: 12px; }
+      button { flex: 1; border: 0; border-radius: 6px; padding: 9px 10px; cursor: pointer; color: white; background: #1a73e8; }
+      button.secondary { color: #1a73e8; background: #e8f0fe; }
+      button.danger { background: #d93025; }
+      pre { white-space: pre-wrap; background: #f8fafd; border: 1px solid #e8eaed; padding: 8px; border-radius: 6px; max-height: 160px; overflow: auto; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>GEO反馈自动化</h1>
+    <label>Python服务地址</label>
+    <input id="serverUrl" value="http://127.0.0.1:8765">
+    <label>并发数</label>
+    <input id="concurrency" type="number" min="1" max="5" value="3">
+    <label>目标关键词（多个用逗号/顿号/or分隔）</label>
+    <input id="keyword" value="贵阳商学院">
+    <div class="row">
+      <button id="start">开始</button>
+      <button id="openLoginTabs" class="secondary">打开平台登录</button>
+      <button id="stop" class="danger">停止</button>
+    </div>
+    <div class="row">
+      <button id="health" class="secondary">检查服务</button>
+      <button id="testShot" class="secondary">测试截图</button>
+    </div>
+    <div class="row">
+      <button id="mockUrls" class="secondary">使用本地模拟平台</button>
+      <button id="realUrls" class="secondary">使用真实AI平台</button>
+    </div>
+    <div class="row">
+      <button id="reloadPage" class="secondary">刷新当前页</button>
+      <button id="reloadExtension" class="secondary">重载插件</button>
+    </div>
+    <div class="row">
+      <button id="resetFailed" class="secondary">重置失败任务</button>
+    </div>
+    <label>状态</label>
+    <pre id="log">等待操作</pre>
+    <script src="popup.js"></script>
+  </body>
+</html>
