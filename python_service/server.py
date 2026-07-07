@@ -32,6 +32,9 @@ from config import (
     SCREENSHOT_DIR,
 )
 
+from ocr_checker import check_keyword
+from image_marker import mark_image
+
 try:
     from openpyxl import load_workbook
     from openpyxl.drawing.image import Image as ExcelImage
@@ -278,6 +281,45 @@ def image_from_data_url(data_url, platform, task_id, matched):
     return path
 
 
+
+def process_screenshot_with_ocr(image_path, keywords):
+    """
+    截图二次检测：
+    OCR识别关键词并画框
+    """
+
+    if not image_path:
+        return {
+            "matched": False
+        }
+
+    try:
+        result = check_keyword(
+            image_path,
+            keywords
+        )
+
+        if result.get("matched"):
+
+            bbox = result.get("bbox")
+
+            if bbox:
+                mark_image(
+                    image_path,
+                    bbox
+                )
+
+        return result
+
+    except Exception as e:
+        print("OCR处理失败:", e)
+
+        return {
+            "matched": False,
+            "error": str(e)
+        }
+
+
 def save_test_screenshot(payload):
     data_url = payload.get("screenshot_data_url")
     if not data_url:
@@ -422,12 +464,45 @@ def submit_result(payload):
         raise ValueError(f"缺少字段：{missing}")
 
     matched = bool(payload.get("matched"))
+
     screenshot_path = image_from_data_url(
         payload.get("screenshot_data_url"),
         payload["platform"],
         payload["task_id"],
         matched,
     )
+
+
+    # OCR 二次确认 + 图片标注
+    if screenshot_path:
+
+        keywords = (
+            payload.get("keywords")
+            or [KEYWORD]
+        )
+
+        ocr_result = process_screenshot_with_ocr(
+            screenshot_path,
+            keywords
+        )
+
+
+        if ocr_result:
+
+            payload["matched"] = ocr_result.get(
+                "matched",
+                matched
+            )
+
+            payload["matched_keywords"] = (
+                ocr_result.get(
+                    "keywords",
+                    []
+                )
+            )
+
+            matched = bool(payload["matched"])
+
 
     with lock:
         if screenshot_path:
