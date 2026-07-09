@@ -36,10 +36,7 @@ def load_persisted_ai_config():
 
 def save_persisted_ai_config():
     AI_JUDGE_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    AI_JUDGE_CONFIG_PATH.write_text(
-        json.dumps(RUNTIME_CONFIG, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    AI_JUDGE_CONFIG_PATH.write_text(json.dumps(RUNTIME_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 load_persisted_ai_config()
@@ -55,13 +52,6 @@ def split_paragraphs(text):
 
 
 def keyword_aliases(keyword):
-    """
-    通用关键词别名：
-    - 原词
-    - 去空格/标点后的规范化词
-    - 贵阳/贵州地域互换（保留用户之前明确需要的地域变体）
-    不再写死学校、商学院、品牌等具体场景别名，避免影响其他 GEO 业务。
-    """
     raw = str(keyword or "").strip()
     aliases = {raw}
     normalized = normalize_text(raw)
@@ -75,22 +65,8 @@ def keyword_aliases(keyword):
 
 
 def paragraph_for_index(text, index):
-    begin = max(
-        text.rfind("\n", 0, index),
-        text.rfind("。", 0, index),
-        text.rfind("！", 0, index),
-        text.rfind("？", 0, index),
-    )
-    end_candidates = [
-        pos
-        for pos in [
-            text.find("\n", index),
-            text.find("。", index),
-            text.find("！", index),
-            text.find("？", index),
-        ]
-        if pos >= 0
-    ]
+    begin = max(text.rfind("\n", 0, index), text.rfind("。", 0, index), text.rfind("！", 0, index), text.rfind("？", 0, index))
+    end_candidates = [pos for pos in [text.find("\n", index), text.find("。", index), text.find("！", index), text.find("？", index)] if pos >= 0]
     end = min(end_candidates) + 1 if end_candidates else min(len(text), index + 220)
     return text[max(0, begin + 1):end].strip()[:260]
 
@@ -108,57 +84,24 @@ def find_evidence(answer_text, keyword):
     for alias in keyword_aliases(keyword):
         index = text.find(alias)
         if index >= 0:
-            return {
-                "matched": True,
-                "keyword": keyword,
-                "matched_text": alias,
-                "evidence": paragraph_for_index(text, index),
-                "match_type": "exact",
-                "confidence": 1.0,
-            }
+            return {"matched": True, "keyword": keyword, "matched_text": alias, "evidence": paragraph_for_index(text, index), "match_type": "exact", "confidence": 1.0}
         normalized_alias = normalize_text(alias)
         normalized_index = normalized_text.find(normalized_alias) if normalized_alias else -1
         if normalized_index >= 0:
             evidence = best_paragraph_by_alias(text, normalized_alias) or text[:200]
-            return {
-                "matched": True,
-                "keyword": keyword,
-                "matched_text": alias,
-                "evidence": evidence,
-                "match_type": "normalized",
-                "confidence": 0.98,
-            }
+            return {"matched": True, "keyword": keyword, "matched_text": alias, "evidence": evidence, "match_type": "normalized", "confidence": 0.98}
     return None
 
 
 def local_judge(answer_text, keywords):
     text = str(answer_text or "").strip()
     if len(normalize_text(text)) < 20:
-        return {
-            "ok": True,
-            "has_answer": False,
-            "matched": False,
-            "reason": "未获取到足够长度的平台正文回答",
-            "source": "local",
-        }
-
+        return {"ok": True, "has_answer": False, "matched": False, "reason": "未获取到足够长度的平台正文回答", "source": "local"}
     for keyword in keywords or []:
         hit = find_evidence(text, keyword)
         if hit:
-            return {
-                "ok": True,
-                "has_answer": True,
-                **hit,
-                "reason": "回答正文中找到目标词或通用别名",
-                "source": "local",
-            }
-    return {
-        "ok": True,
-        "has_answer": True,
-        "matched": False,
-        "reason": "回答正文已获取，但本地规则未发现目标词",
-        "source": "local",
-    }
+            return {"ok": True, "has_answer": True, **hit, "reason": "回答正文中找到目标词或通用别名", "source": "local"}
+    return {"ok": True, "has_answer": True, "matched": False, "reason": "回答正文已获取，但本地规则未发现目标词", "source": "local"}
 
 
 def configure_ai_judge(payload):
@@ -208,16 +151,10 @@ def call_chat_completions(payload):
     request = urllib.request.Request(
         chat_completions_url(),
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {RUNTIME_CONFIG.get('api_key')}",
-        },
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {RUNTIME_CONFIG.get('api_key')}"},
         method="POST",
     )
-    with urllib.request.urlopen(
-        request,
-        timeout=RUNTIME_CONFIG.get("timeout_seconds") or AI_JUDGE_TIMEOUT_SECONDS,
-    ) as response:
+    with urllib.request.urlopen(request, timeout=RUNTIME_CONFIG.get("timeout_seconds") or AI_JUDGE_TIMEOUT_SECONDS) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -225,84 +162,30 @@ def ai_judge(answer_text, keywords, question="", platform=""):
     local = local_judge(answer_text, keywords)
     if local.get("matched") or not local.get("has_answer"):
         return local
-
-    if not (
-        RUNTIME_CONFIG.get("enabled")
-        and RUNTIME_CONFIG.get("api_url")
-        and RUNTIME_CONFIG.get("api_key")
-        and RUNTIME_CONFIG.get("model")
-    ):
+    if not (RUNTIME_CONFIG.get("enabled") and RUNTIME_CONFIG.get("api_url") and RUNTIME_CONFIG.get("api_key") and RUNTIME_CONFIG.get("model")):
         return local
-
     payload = {
         "model": RUNTIME_CONFIG.get("model"),
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "你是本地GEO反馈检测质检器。你只判断一段AI平台回复是否真实提到了目标对象。"
-                    "适用于学校、酒店、品牌、产品、机构、政策、服务、地点等不同场景。"
-                    "必须返回严格JSON，不要输出解释文本。"
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "platform": platform,
-                        "question": str(question or "")[:800],
-                        "target_keywords": keywords or [],
-                        "matching_rules": [
-                            "只要回答正文真实出现目标关键词、目标对象名称、明确简称或通用别名，可以算命中。",
-                            "如果只是泛泛提到某一类别，不指向目标对象本身，不算命中。",
-                            "evidence必须摘自answer_text中实际出现的原文片段。",
-                        ],
-                        "answer_text": str(answer_text or "")[:12000],
-                        "return_schema": {
-                            "matched": "boolean，是否在语义上指向任一目标关键词",
-                            "keyword": "命中的目标关键词，没有则为空字符串",
-                            "matched_text": "回答中实际出现的证据词，没有则为空字符串",
-                            "evidence": "回答原文里最能证明命中的一句或一小段，必须来自answer_text",
-                            "confidence": "0到1",
-                            "reason": "简短原因",
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-            },
+            {"role": "system", "content": "你是本地GEO反馈检测质检器。你只判断一段AI平台回复是否真实提到了目标对象。适用于学校、酒店、品牌、产品、机构、政策、服务、地点等不同场景。必须返回严格JSON，不要输出解释文本。"},
+            {"role": "user", "content": json.dumps({"platform": platform, "question": str(question or "")[:800], "target_keywords": keywords or [], "matching_rules": ["只要回答正文真实出现目标关键词、目标对象名称、明确简称或通用别名，可以算命中。", "如果只是泛泛提到某一类别，不指向目标对象本身，不算命中。", "evidence必须摘自answer_text中实际出现的原文片段。"], "answer_text": str(answer_text or "")[:12000], "return_schema": {"matched": "boolean，是否在语义上指向任一目标关键词", "keyword": "命中的目标关键词，没有则为空字符串", "matched_text": "回答中实际出现的证据词，没有则为空字符串", "evidence": "回答原文里最能证明命中的一句或一小段，必须来自answer_text", "confidence": "0到1", "reason": "简短原因"}}, ensure_ascii=False)},
         ],
         "temperature": 0,
         "response_format": {"type": "json_object"},
     }
-
     try:
         body = call_chat_completions(payload)
-        content = body["choices"][0]["message"]["content"]
-        judged = json.loads(content)
+        judged = json.loads(body["choices"][0]["message"]["content"])
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
         local["ai_error"] = str(exc)
         return local
-
     matched = bool(judged.get("matched"))
     evidence = str(judged.get("evidence") or "").strip()
     keyword = str(judged.get("keyword") or (keywords[0] if keywords else "")).strip()
     matched_text = str(judged.get("matched_text") or keyword).strip()
-
     if matched and evidence and evidence not in str(answer_text or ""):
         matched = False
-
-    return {
-        "ok": True,
-        "has_answer": True,
-        "matched": matched,
-        "keyword": keyword if matched else "",
-        "matched_text": matched_text if matched else "",
-        "evidence": evidence if matched else "",
-        "match_type": "ai_semantic" if matched else "none",
-        "confidence": float(judged.get("confidence") or 0),
-        "reason": str(judged.get("reason") or "AI语义判定"),
-        "source": "ai",
-    }
+    return {"ok": True, "has_answer": True, "matched": matched, "keyword": keyword if matched else "", "matched_text": matched_text if matched else "", "evidence": evidence if matched else "", "match_type": "ai_semantic" if matched else "none", "confidence": float(judged.get("confidence") or 0), "reason": str(judged.get("reason") or "AI语义判定"), "source": "ai"}
 
 
 def contains_forbidden_keyword(text, keywords):
@@ -327,9 +210,7 @@ def redact_forbidden_terms(text, keywords):
 def compact_for_prompt(text, limit):
     text = re.sub(r"```[\s\S]*?```", " ", str(text or ""))
     text = re.sub(r"\s+", " ", text).strip()
-    if len(text) <= limit:
-        return text
-    return text[-limit:]
+    return text if len(text) <= limit else text[-limit:]
 
 
 def parse_followup_content(content):
@@ -347,62 +228,83 @@ def parse_followup_content(content):
 
 
 def followup_config_ready():
-    return bool(
-        RUNTIME_CONFIG.get("api_url")
-        and RUNTIME_CONFIG.get("api_key")
-        and RUNTIME_CONFIG.get("model")
-    )
+    return bool(RUNTIME_CONFIG.get("api_url") and RUNTIME_CONFIG.get("api_key") and RUNTIME_CONFIG.get("model"))
+
+
+def normalize_conversation_item(item):
+    if not isinstance(item, dict):
+        return None
+    role = str(item.get("role") or "").strip()
+    content = str(item.get("content") or "").strip()
+    if role not in ("user", "assistant") or not content:
+        return None
+    return {"role": role, "content": content[:4000]}
+
+
+def parse_followup_context(question, answer_text, platform):
+    ctx = {}
+    if isinstance(question, dict):
+        ctx = dict(question)
+    else:
+        text = str(question or "").strip()
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    ctx = parsed
+            except Exception:
+                ctx = {}
+    previous_question = str(ctx.get("question") or question or "").strip()
+    real_answer = str(ctx.get("answer") or answer_text or "").strip()
+    real_platform = str(ctx.get("platform") or platform or "").strip()
+    conversation = [normalize_conversation_item(item) for item in (ctx.get("conversation") or [])]
+    conversation = [item for item in conversation if item]
+    if not conversation and previous_question and real_answer:
+        conversation = [{"role": "user", "content": previous_question}, {"role": "assistant", "content": real_answer}]
+    return previous_question, real_answer, real_platform, conversation
 
 
 def generate_followup(question, answer_text, keywords, followup_count=0, platform=""):
     keywords = [str(item).strip() for item in (keywords or []) if str(item).strip()]
+    previous_question, real_answer, real_platform, conversation = parse_followup_context(question, answer_text, platform)
     if not keywords:
-        return {"ok": False, "prompt": "", "source": "error", "reason": "缺少目标关键词"}
-    if len(normalize_text(answer_text)) < 20:
-        return {"ok": False, "prompt": "", "source": "error", "reason": "没有获取到足够长度的平台真实回复，停止追问"}
+        return {"ok": False, "prompt": "", "source": "error", "reason": "缺少目标关键词", "real_answer_valid": False, "conversation_turns": len(conversation)}
+    if len(normalize_text(real_answer)) < 20:
+        return {"ok": False, "prompt": "", "source": "error", "reason": "没有获取到足够长度的平台真实回复，停止追问", "real_answer_valid": False, "conversation_turns": len(conversation)}
     if not followup_config_ready():
-        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问接口配置不完整，已停止追问，避免使用固定模板"}
+        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问接口配置不完整，已停止追问，避免使用固定模板", "real_answer_valid": True, "conversation_turns": len(conversation)}
 
     forbidden_terms = sorted({alias for keyword in keywords for alias in keyword_aliases(keyword)}, key=len, reverse=True)
+    safe_conversation = []
+    for item in conversation[-8:]:
+        safe_conversation.append({"role": item["role"], "content": redact_forbidden_terms(compact_for_prompt(item["content"], 1800), keywords)})
+
+    structured_input = {
+        "question": redact_forbidden_terms(compact_for_prompt(previous_question, 700), keywords),
+        "answer": redact_forbidden_terms(compact_for_prompt(real_answer, 2200), keywords),
+        "platform": real_platform,
+        "conversation": safe_conversation,
+        "followup_count": followup_count,
+        "forbidden_terms": forbidden_terms,
+        "task": "根据 conversation 中最后一条 assistant 真实回答，生成一句自然追问。不要回答问题本身。",
+        "rules": [
+            "必须根据最后一条assistant真实回答生成，不能泛泛套模板。",
+            "如果最后一条回答已经很完整，就从其内容中选择一个自然延伸角度继续问。",
+            "不要出现任何forbidden_terms中的词或其明显变体。",
+            "不能直接给出目标关键词、目标对象名称、简称或别名。",
+            "不能包含测试、命中、目标词、关键词、GEO检测等元信息。",
+            "不能输出代码、SQL、JSON、HTML、操作步骤、列表或多条问题。",
+            "只能问一个方向，必须像普通用户继续追问。",
+            "长度控制在40到120个中文字符。",
+        ],
+        "return_schema": {"prompt": "下一轮追问文本", "intent": "为什么这样追问，20字以内"},
+    }
+
     payload = {
         "model": RUNTIME_CONFIG.get("model"),
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "你是GEO反馈检测追问生成器。你的任务是根据上一轮AI平台真实回复，生成一句自然追问，"
-                    "引导被测AI补充可能遗漏的相关对象。适用于学校、酒店、品牌、产品、机构、政策、服务、地点等任意场景。"
-                    "追问必须像普通用户继续提问，不能暴露测试目的。不能出现目标关键词、目标对象名称、简称或别名。"
-                    "只返回严格JSON，不要输出解释文本。"
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "platform": platform,
-                        "followup_count": followup_count,
-                        "previous_question": redact_forbidden_terms(compact_for_prompt(question, 700), keywords),
-                        "current_answer_summary": redact_forbidden_terms(compact_for_prompt(answer_text, 1800), keywords),
-                        "forbidden_terms": forbidden_terms,
-                        "task": "只生成一句下一轮追问，不要回答问题本身。",
-                        "rules": [
-                            "不要出现任何forbidden_terms中的词或其明显变体。",
-                            "不能直接给出目标关键词、目标对象名称、简称或别名。",
-                            "只能根据上一轮回答内容的缺口，从类型、地区、价格/成本、适用人群、口碑、替代选择、服务能力、场景匹配等角度自然追问。",
-                            "不能包含测试、命中、目标词、关键词、GEO检测等元信息。",
-                            "不能输出代码、SQL、JSON、HTML、操作步骤、列表或多条问题。",
-                            "只能问一个方向，必须承接上一轮回答。",
-                            "长度控制在40到120个中文字符。",
-                        ],
-                        "return_schema": {
-                            "prompt": "下一轮追问文本",
-                            "intent": "为什么这样追问，20字以内",
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-            },
+            {"role": "system", "content": "你是GEO反馈检测追问生成器。你会收到结构化输入：question、answer、platform、conversation。你必须判断answer是否是真实可用回答，并基于conversation最后一条assistant回答生成一句自然追问。追问不能出现目标关键词、目标对象名称、简称或别名。只返回严格JSON。"},
+            {"role": "user", "content": json.dumps(structured_input, ensure_ascii=False)},
         ],
         "temperature": 0.45,
         "response_format": {"type": "json_object"},
@@ -425,14 +327,14 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
         content = body["choices"][0]["message"]["content"]
         prompt, intent = parse_followup_content(content)
     except Exception as exc:
-        return {"ok": False, "prompt": "", "source": "error", "reason": f"AI追问生成失败：{exc}"}
+        return {"ok": False, "prompt": "", "source": "error", "reason": f"AI追问生成失败：{exc}", "real_answer_valid": True, "conversation_turns": len(conversation)}
 
     prompt = str(prompt or "").strip()
     if not prompt:
-        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问为空"}
+        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问为空", "real_answer_valid": True, "conversation_turns": len(conversation)}
     if contains_forbidden_keyword(prompt, keywords):
-        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问包含目标关键词或别名，已停止追问"}
+        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问包含目标关键词或别名，已停止追问", "real_answer_valid": True, "conversation_turns": len(conversation)}
     if len(prompt) > 160 or "\n" in prompt:
-        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问格式不合规，已停止追问"}
+        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问格式不合规，已停止追问", "real_answer_valid": True, "conversation_turns": len(conversation)}
 
-    return {"ok": True, "prompt": prompt, "source": "ai", "intent": intent, "api_mode": api_mode}
+    return {"ok": True, "prompt": prompt, "source": "ai", "intent": intent, "api_mode": api_mode, "real_answer_valid": True, "conversation_turns": len(conversation), "used_structured_context": True}
