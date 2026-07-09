@@ -57,6 +57,16 @@ function splitKeywords(value) {
     .filter(Boolean);
 }
 
+function canonicalPlatformKey(value, name = "", url = "") {
+  const text = `${value || ""} ${name || ""} ${url || ""}`.toLowerCase();
+  if (/doubao|豆包|www\.doubao\.com|doubao\.com/.test(text)) return "doubao";
+  if (/qianwen|千问|通义|tongyi\.aliyun\.com|aliyun\.com\/qianwen/.test(text)) return "qianwen";
+  if (/deepseek|深度求索|chat\.deepseek\.com/.test(text)) return "deepseek";
+  if (/yuanbao|元宝|腾讯元宝|yuanbao\.tencent\.com/.test(text)) return "yuanbao";
+  if (/wenxin|文心|一言|yiyan|chat\.baidu\.com|baidu\.com/.test(text)) return "wenxin";
+  return "";
+}
+
 function defaultPlatforms(urlOverride = null) {
   return Object.entries(DEFAULT_PLATFORM_URLS).map(([key, url]) => ({
     key,
@@ -65,7 +75,9 @@ function defaultPlatforms(urlOverride = null) {
   }));
 }
 
-function platformKeyFromName(name, index) {
+function platformKeyFromName(name, index, url = "") {
+  const canonical = canonicalPlatformKey("", name, url);
+  if (canonical) return canonical;
   const known = Object.entries(PLATFORM_LABELS).find(([, label]) => label === name);
   if (known) return known[0];
   return `custom_${index + 1}_${String(name || "platform").replace(/\W+/g, "_").slice(0, 24)}`;
@@ -77,7 +89,7 @@ function renderPlatforms(platforms) {
   list.forEach((platform, index) => {
     const row = document.createElement("div");
     row.className = "platform-row";
-    row.dataset.platformKey = platform.key || platformKeyFromName(platform.name, index);
+    row.dataset.platformKey = canonicalPlatformKey(platform.key, platform.name, platform.url) || platform.key || platformKeyFromName(platform.name, index, platform.url);
     row.innerHTML = `
       <input data-platform-name value="${platform.name || platform.key || `平台${index + 1}`}">
       <input data-platform-url value="${platform.url || ""}">
@@ -97,7 +109,8 @@ function readForm() {
     const name = row.querySelector("[data-platform-name]").value.trim() || `平台${index + 1}`;
     const url = row.querySelector("[data-platform-url]").value.trim();
     if (!url) return;
-    const key = row.dataset.platformKey || platformKeyFromName(name, index);
+    const key = canonicalPlatformKey(row.dataset.platformKey, name, url) || row.dataset.platformKey || platformKeyFromName(name, index, url);
+    row.dataset.platformKey = key;
     platforms.push({ key, name, url });
     platformUrls[key] = url;
   });
@@ -110,7 +123,19 @@ function readForm() {
   return { serverUrl, concurrency, keyword, platforms, platformUrls, aiJudge };
 }
 
+function normalizePlatformRows() {
+  platformsEl.querySelectorAll(".platform-row").forEach((row, index) => {
+    const nameInput = row.querySelector("[data-platform-name]");
+    const urlInput = row.querySelector("[data-platform-url]");
+    const name = nameInput ? nameInput.value.trim() : "";
+    const url = urlInput ? urlInput.value.trim() : "";
+    const canonical = canonicalPlatformKey(row.dataset.platformKey, name, url);
+    if (canonical) row.dataset.platformKey = canonical;
+  });
+}
+
 async function saveSettings() {
+  normalizePlatformRows();
   const form = readForm();
   const result = await send("SAVE_SETTINGS", form);
   return { ...result, platforms: form.platforms, aiJudge: { ...form.aiJudge, api_key: form.aiJudge.api_key ? "***" : "" } };
@@ -199,6 +224,9 @@ document.getElementById("addPlatform").addEventListener("click", () => {
   renderPlatforms(current);
 });
 
+platformsEl.addEventListener("input", normalizePlatformRows);
+platformsEl.addEventListener("change", normalizePlatformRows);
+
 platformsEl.addEventListener("click", (event) => {
   if (!event.target.matches("[data-remove-platform]")) return;
   event.target.closest(".platform-row").remove();
@@ -262,6 +290,7 @@ send("GET_SETTINGS").then((data) => {
   } else {
     renderPlatforms(defaultPlatforms());
   }
+  normalizePlatformRows();
 }).catch(() => {
   chrome.storage.local.get(["serverUrl", "concurrency", "keyword", "platforms", "platformUrls", "aiJudge"], (data) => {
     if (data.serverUrl) serverUrlInput.value = data.serverUrl;
@@ -279,5 +308,6 @@ send("GET_SETTINGS").then((data) => {
     } else {
       renderPlatforms(defaultPlatforms());
     }
+    normalizePlatformRows();
   });
 });
