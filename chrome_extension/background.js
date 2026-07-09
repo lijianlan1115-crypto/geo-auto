@@ -3,7 +3,7 @@ let activeCount = 0;
 let currentServerUrl = "http://127.0.0.1:8765";
 let currentConcurrency = 3;
 
-const CONTENT_SCRIPTS = ["content_script.js", "content_script_geo_patch.js"];
+const CONTENT_SCRIPTS = ["content_script.js", "content_script_geo_patch.js", "content_script_platform_patch.js"];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function splitKeywords(value) {
