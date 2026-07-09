@@ -3,11 +3,12 @@ let activeCount = 0;
 let currentServerUrl = "http://127.0.0.1:8765";
 let currentConcurrency = 3;
 
+const CONTENT_SCRIPTS = ["content_script.js", "content_script_geo_patch.js"];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function splitKeywords(value) {
-  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
-  return String(value || "贵阳商学院")
+  if (Array.isArray(value)) return value.map((item) => String(item || "").trim()).filter(Boolean);
+  return String(value || "")
     .split(/[\n,，、;；|/]+|\s+or\s+|\s+OR\s+/)
     .map((item) => item.trim())
     .filter(Boolean);
@@ -51,9 +52,7 @@ async function waitForTabLoaded(tabId, timeoutMs = 60000) {
 }
 
 async function createTaskWindow(url) {
-  // 创建独立窗口，不最小化（避免 captureVisibleTab 返回空图）
-  // 不指定位置，让 Chrome 自动放在默认可见区域，多个窗口会堆叠但互不干扰
-  const window = await chrome.windows.create({
+  return await chrome.windows.create({
     url,
     type: "normal",
     state: "normal",
@@ -61,7 +60,22 @@ async function createTaskWindow(url) {
     width: 1280,
     height: 800,
   });
-  return window;
+}
+
+async function injectAutomationScripts(tabId) {
+  for (const file of CONTENT_SCRIPTS) {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: [file],
+    }).catch(() => {});
+  }
+}
+
+async function effectiveTaskKeywords(task) {
+  const data = await chrome.storage.local.get(["keyword"]);
+  const taskKeywords = splitKeywords(task.keywords || task.keyword);
+  const configuredKeywords = splitKeywords(data.keyword);
+  return taskKeywords.length ? taskKeywords : configuredKeywords;
 }
 
 async function runOneTask(task) {
@@ -80,16 +94,14 @@ async function runOneTask(task) {
 
     await waitForTabLoaded(tab.id);
     await sleep(2500);
+    await injectAutomationScripts(tab.id);
 
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ["content_script.js"],
-    }).catch(() => {});
-
-    if (!task.keywords || !task.keywords.length) {
-      task.keywords = ["贵阳商学院"];
-      task.keyword = "贵阳商学院";
+    const keywords = await effectiveTaskKeywords(task);
+    if (!keywords.length) {
+      throw new Error("缺少目标关键词：请在 Excel 关键词列或插件面板中填写目标关键词后再开始。");
     }
+    task.keywords = keywords;
+    task.keyword = keywords[0];
 
     let scriptResult;
     try {
@@ -103,10 +115,7 @@ async function runOneTask(task) {
       if (!/Frame with ID .*was removed|Extension context invalidated|Cannot access/.test(message)) throw error;
       await sleep(2500);
       await waitForTabLoaded(tab.id).catch(() => {});
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ["content_script.js"],
-      }).catch(() => {});
+      await injectAutomationScripts(tab.id);
       scriptResult = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: (payload) => window.geoAutomationRun(payload),
@@ -180,10 +189,9 @@ async function testScreenshot(keywordText) {
     ? excelKeywords.keywords
     : splitKeywords(keywordText);
 
-  await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    files: ["content_script.js"],
-  }).catch(() => {});
+  if (!keywords.length) throw new Error("缺少测试关键词，请先在插件面板或 Excel 关键词列中填写。 ");
+
+  await injectAutomationScripts(tab.id);
 
   const [{ result }] = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
@@ -347,7 +355,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         ok: true,
         serverUrl: data.serverUrl || currentServerUrl,
         concurrency: data.concurrency || currentConcurrency,
-        keyword: data.keyword || "贵阳商学院",
+        keyword: data.keyword || "",
         platformUrls: data.platformUrls || {},
         platforms: data.platforms || [],
         aiJudge,
@@ -368,7 +376,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       await chrome.storage.local.set({
         serverUrl: currentServerUrl,
         concurrency: currentConcurrency,
-        keyword: message.keyword || "贵阳商学院",
+        keyword: message.keyword || "",
         platformUrls: message.platformUrls || {},
         platforms: message.platforms || [],
         aiJudge: nextAiJudge,
@@ -391,7 +399,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.action === "TEST_SCREENSHOT") {
       currentServerUrl = message.serverUrl || currentServerUrl;
-      const keyword = message.keyword || "贵阳商学院";
+      const keyword = message.keyword || "";
       await chrome.storage.local.set({ serverUrl: currentServerUrl, keyword });
       sendResponse(await testScreenshot(keyword));
       return;
