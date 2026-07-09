@@ -27,7 +27,7 @@
     <label>并发数</label>
     <input id="concurrency" type="number" min="1" max="5" value="3">
     <label>目标关键词（多个用逗号/顿号/or分隔）</label>
-    <input id="keyword" value="贵阳商学院">
+    <input id="keyword" placeholder="例如：目标品牌A、某某酒店、某某学校">
     <label class="inline"><input id="aiJudgeEnabled" type="checkbox">启用内部 AI 判定</label>
     <label>AI 接口地址</label>
     <input id="aiJudgeApiUrl" placeholder="https://api.example.com/v1/chat/completions">
@@ -52,8 +52,11 @@
       <button id="testShot" class="secondary">测试截图</button>
     </div>
     <div class="row">
-      <button id="mockUrls" class="secondary">使用本地模拟平台</button>
+      <button id="testFollowup" class="secondary">测试AI追问</button>
       <button id="realUrls" class="secondary">使用真实AI平台</button>
+    </div>
+    <div class="row">
+      <button id="mockUrls" class="secondary">使用本地模拟平台</button>
     </div>
     <div class="row">
       <button id="reloadPage" class="secondary">刷新当前页</button>
