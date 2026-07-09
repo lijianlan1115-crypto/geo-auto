@@ -14,14 +14,31 @@ function splitKeywords(value) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(`${currentServerUrl}${path}`, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
-  });
-  return response.json();
+  try {
+    const response = await fetch(`${currentServerUrl}${path}`, {
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        ...(options.headers || {}),
+      },
+    });
+    const text = await response.text();
+    let payload = {};
+    try {
+      payload = text ? JSON.parse(text) : {};
+    } catch (error) {
+      payload = { ok: false, error: text || response.statusText };
+    }
+    if (!response.ok) {
+      return { ok: false, error: payload.error || `Python 服务返回 HTTP ${response.status}` };
+    }
+    return payload;
+  } catch (error) {
+    return {
+      ok: false,
+      error: `连接不上 Python 服务：${currentServerUrl}。请先启动 python_service/server.py，再点“检查服务”。原始错误：${String(error && error.message ? error.message : error)}`,
+    };
+  }
 }
 
 async function waitForTabLoaded(tabId, timeoutMs = 60000) {
@@ -33,15 +50,37 @@ async function waitForTabLoaded(tabId, timeoutMs = 60000) {
   }
 }
 
+async function createTaskWindow(url) {
+  // 创建独立窗口，不最小化（避免 captureVisibleTab 返回空图）
+  // 不指定位置，让 Chrome 自动放在默认可见区域，多个窗口会堆叠但互不干扰
+  const window = await chrome.windows.create({
+    url,
+    type: "normal",
+    state: "normal",
+    focused: false,
+    width: 1280,
+    height: 800,
+  });
+  return window;
+}
+
 async function runOneTask(task) {
-  let tab;
+  let win = null;
+  let tab = null;
   try {
     const data = await chrome.storage.local.get(["platformUrls"]);
     const customUrl = data.platformUrls && data.platformUrls[task.platform];
     const platformUrl = customUrl || task.platform_url;
-    tab = await chrome.tabs.create({ url: platformUrl, active: false });
+
+    win = await createTaskWindow(platformUrl);
+    if (!win || !win.id || !win.tabs || !win.tabs.length) {
+      throw new Error("无法创建任务窗口");
+    }
+    tab = win.tabs[0];
+
     await waitForTabLoaded(tab.id);
     await sleep(2500);
+
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       files: ["content_script.js"],
@@ -52,48 +91,39 @@ async function runOneTask(task) {
       task.keyword = "贵阳商学院";
     }
 
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: (payload) => window.geoAutomationRun(payload),
-      args: [task],
-    });
-
-    if (!result || result.error) {
-      throw new Error(result && result.error ? result.error : "content script did not return result");
-    }
-
-    await chrome.tabs.update(tab.id, { active: true });
-    
-    await sleep(1000);
-    
-    if (result && result.matched) {
+    let scriptResult;
+    try {
+      scriptResult = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: (payload) => window.geoAutomationRun(payload),
+        args: [task],
+      });
+    } catch (error) {
+      const message = String(error && error.message ? error.message : error);
+      if (!/Frame with ID .*was removed|Extension context invalidated|Cannot access/.test(message)) throw error;
+      await sleep(2500);
+      await waitForTabLoaded(tab.id).catch(() => {});
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: async () => window.geoAutomationRefreshMarks && await window.geoAutomationRefreshMarks(),
+        files: ["content_script.js"],
       }).catch(() => {});
+      scriptResult = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: (payload) => window.geoAutomationRun(payload),
+        args: [task],
+      });
     }
-    
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => {
-        document.body.style.cursor = 'none';
-        const activeEl = document.activeElement;
-        if (activeEl) {
-          activeEl.blur();
-        }
-      },
-    }).catch(() => {});
-    
-    await sleep(500);
-    
-    const screenshotDataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
-    
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => {
-        document.body.style.cursor = '';
-      },
-    }).catch(() => {});
+
+    const [{ result }] = scriptResult;
+
+    if (!result || result.error) {
+      const err = new Error(result && result.error ? result.error : "content script did not return result");
+      if (result) {
+        err.answer_debug = result.answer_debug || null;
+        err.run_debug = result.run_debug || [];
+      }
+      throw err;
+    }
 
     await api("/submit-result", {
       method: "POST",
@@ -107,7 +137,11 @@ async function runOneTask(task) {
         followup_count: result ? result.followup_count : 0,
         answer_text: result ? result.answer_text : "",
         error: result ? result.error : "content script did not return result",
-        screenshot_data_url: screenshotDataUrl,
+        screenshot_data_url: result && result.screenshot_data_url ? result.screenshot_data_url : null,
+        dom_location: result && result.dom_location ? result.dom_location : null,
+        answer_debug: result && result.answer_debug ? result.answer_debug : null,
+        run_debug: result && result.run_debug ? result.run_debug : [],
+        keywords: task.keywords,
       }),
     });
   } catch (error) {
@@ -116,14 +150,24 @@ async function runOneTask(task) {
       body: JSON.stringify({
         task_id: task.task_id,
         error: String(error && error.message ? error.message : error),
+        answer_debug: error && error.answer_debug ? error.answer_debug : null,
+        run_debug: error && error.run_debug ? error.run_debug : [],
       }),
     }).catch(() => {});
   } finally {
     activeCount -= 1;
-    if (tab && tab.id) {
-      await chrome.tabs.remove(tab.id).catch(() => {});
+    if (win && win.id) {
+      await chrome.windows.remove(win.id).catch(() => {});
     }
     pump();
+  }
+}
+
+async function captureTabScreenshot(windowId) {
+  try {
+    return await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+  } catch (e) {
+    return null;
   }
 }
 
@@ -135,35 +179,22 @@ async function testScreenshot(keywordText) {
   const keywords = excelKeywords && excelKeywords.ok && excelKeywords.keywords && excelKeywords.keywords.length
     ? excelKeywords.keywords
     : splitKeywords(keywordText);
+
   await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    files: ["content_script.js"],
+  }).catch(() => {});
+
+  const [{ result }] = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     func: async (targetKeywords) => await window.geoAutomationTestScreenshot(targetKeywords),
     args: [keywords],
   });
 
-  await sleep(1500);
-  
-  await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: () => {
-      document.body.style.cursor = 'none';
-      const activeEl = document.activeElement;
-      if (activeEl) {
-        activeEl.blur();
-      }
-    },
-  }).catch(() => {});
-  
-  await sleep(500);
-  
-  const screenshotDataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
-  
-  await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: () => {
-      document.body.style.cursor = '';
-    },
-  }).catch(() => {});
+  const screenshotDataUrl = result && result.screenshot_data_url
+    ? result.screenshot_data_url
+    : await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+
   const saved = await api("/save-test-screenshot", {
     method: "POST",
     body: JSON.stringify({
@@ -172,43 +203,51 @@ async function testScreenshot(keywordText) {
       screenshot_data_url: screenshotDataUrl,
     }),
   });
+
   return {
     ...saved,
     keywords,
     keyword_source: excelKeywords ? excelKeywords.source : "input",
     keyword_message: excelKeywords ? excelKeywords.message : undefined,
     excel_row_number: excelKeywords ? excelKeywords.row_number : undefined,
+    dom_location: result && result.dom_location ? result.dom_location : null,
   };
 }
 
 async function openLoginTabs() {
-  const data = await chrome.storage.local.get(["platformUrls"]);
-  const defaultUrls = {
-    doubao: "https://www.doubao.com/chat/",
-    qianwen: "https://tongyi.aliyun.com/qianwen/",
-    deepseek: "https://chat.deepseek.com/",
-    yuanbao: "https://yuanbao.tencent.com/chat/",
-    wenxin: "https://chat.baidu.com/?enter_type=yiyan_site",
-  };
-  const urls = { ...defaultUrls, ...(data.platformUrls || {}) };
+  const data = await chrome.storage.local.get(["platforms", "platformUrls"]);
+  const list = data.platforms && data.platforms.length
+    ? data.platforms
+    : Object.entries(data.platformUrls || {}).map(([key, url]) => ({ key, name: key, url }));
   const opened = [];
 
-  for (const [platform, url] of Object.entries(urls)) {
-    const tab = await chrome.tabs.create({ url, active: platform === "deepseek" });
-    opened.push({ platform, url, tabId: tab.id });
+  for (const item of list) {
+    const tab = await chrome.tabs.create({ url: item.url, active: false });
+    opened.push({ platform: item.key, name: item.name, url: item.url, tabId: tab.id });
     await sleep(600);
   }
 
   return {
     ok: true,
-    message: "已打开5个平台，请先逐个登录；登录完成后再点“开始”。",
+    message: `已打开${opened.length}个平台，请先逐个登录；登录完成后再点“开始”。`,
     opened,
   };
 }
 
+async function getEffectiveConcurrency() {
+  const data = await chrome.storage.local.get(["concurrency"]);
+  return Math.max(1, Math.min(5, Number(data.concurrency || currentConcurrency)));
+}
+
 async function pump() {
   if (!running) return;
-  while (running && activeCount < currentConcurrency) {
+  while (running) {
+    const effectiveConcurrency = await getEffectiveConcurrency();
+    if (activeCount >= effectiveConcurrency) {
+      await sleep(1000);
+      continue;
+    }
+
     const data = await api("/next-task");
     if (!data.ok || !data.task) {
       running = false;
@@ -220,8 +259,82 @@ async function pump() {
   }
 }
 
+async function syncRunConfig(platforms, aiJudge) {
+  if (platforms && platforms.length) {
+    const configured = await api("/set-platforms", {
+      method: "POST",
+      body: JSON.stringify({ platforms }),
+    });
+    if (!configured || !configured.ok) return configured;
+  }
+  if (aiJudge !== undefined && aiJudge !== null) {
+    const configured = await api("/ai-judge-config", {
+      method: "POST",
+      body: JSON.stringify(aiJudge),
+    });
+    if (!configured || !configured.ok) return configured;
+  }
+  return { ok: true };
+}
+
+async function mergedSettingsFromStorage() {
+  const data = await chrome.storage.local.get(["serverUrl", "concurrency", "platformUrls", "platforms", "keyword", "aiJudge"]);
+  currentServerUrl = data.serverUrl || currentServerUrl;
+  const storedAiJudge = data.aiJudge || {};
+  const serverAiJudge = await api("/ai-judge-config").catch(() => null);
+  const aiJudge = {
+    ...storedAiJudge,
+    ...(serverAiJudge && serverAiJudge.ok ? {
+      enabled: Boolean(serverAiJudge.enabled),
+      api_url: serverAiJudge.api_url || storedAiJudge.api_url || "",
+      model: serverAiJudge.model || storedAiJudge.model || "",
+      has_api_key: Boolean(serverAiJudge.has_api_key || storedAiJudge.api_key),
+      api_key_preview: serverAiJudge.api_key_preview || (storedAiJudge.api_key ? "***" : ""),
+    } : {}),
+    api_key: storedAiJudge.api_key || "",
+  };
+  return { data, aiJudge };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
+    if (message.action === "CAPTURE_TAB") {
+      if (!sender.tab || !sender.tab.windowId) {
+        sendResponse({ ok: false, error: "找不到窗口" });
+        return;
+      }
+      const screenshotDataUrl = await captureTabScreenshot(sender.tab.windowId);
+      sendResponse({ ok: Boolean(screenshotDataUrl), screenshotDataUrl });
+      return;
+    }
+
+    if (message.action === "JUDGE_ANSWER") {
+      sendResponse(await api("/judge-answer", {
+        method: "POST",
+        body: JSON.stringify({
+          answer_text: message.answer_text || "",
+          keywords: message.keywords || [],
+          question: message.question || "",
+          platform: message.platform || "",
+        }),
+      }));
+      return;
+    }
+
+    if (message.action === "GENERATE_FOLLOWUP") {
+      sendResponse(await api("/generate-followup", {
+        method: "POST",
+        body: JSON.stringify({
+          answer_text: message.answer_text || "",
+          keywords: message.keywords || [],
+          question: message.question || "",
+          platform: message.platform || "",
+          followup_count: message.followup_count || 0,
+        }),
+      }));
+      return;
+    }
+
     if (message.action === "HEALTH") {
       currentServerUrl = message.serverUrl || currentServerUrl;
       sendResponse(await api("/health"));
@@ -229,13 +342,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.action === "GET_SETTINGS") {
-      const data = await chrome.storage.local.get(["serverUrl", "concurrency", "platformUrls", "keyword"]);
+      const { data, aiJudge } = await mergedSettingsFromStorage();
       sendResponse({
         ok: true,
         serverUrl: data.serverUrl || currentServerUrl,
         concurrency: data.concurrency || currentConcurrency,
         keyword: data.keyword || "贵阳商学院",
         platformUrls: data.platformUrls || {},
+        platforms: data.platforms || [],
+        aiJudge,
       });
       return;
     }
@@ -243,13 +358,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === "SAVE_SETTINGS") {
       currentServerUrl = message.serverUrl || currentServerUrl;
       currentConcurrency = Math.max(1, Math.min(5, Number(message.concurrency || currentConcurrency)));
+      const existing = await chrome.storage.local.get(["aiJudge"]);
+      const existingAiJudge = existing.aiJudge || {};
+      const nextAiJudge = {
+        ...existingAiJudge,
+        ...(message.aiJudge || {}),
+        api_key: message.aiJudge && message.aiJudge.api_key ? message.aiJudge.api_key : (existingAiJudge.api_key || ""),
+      };
       await chrome.storage.local.set({
         serverUrl: currentServerUrl,
         concurrency: currentConcurrency,
         keyword: message.keyword || "贵阳商学院",
         platformUrls: message.platformUrls || {},
+        platforms: message.platforms || [],
+        aiJudge: nextAiJudge,
       });
-      sendResponse({ ok: true });
+      const synced = await syncRunConfig(message.platforms || [], message.aiJudge ? { ...message.aiJudge, api_key: message.aiJudge.api_key || "" } : undefined).catch((error) => ({
+        ok: false,
+        error: String(error && error.message ? error.message : error),
+      }));
+      if (!synced || !synced.ok) {
+        sendResponse({
+          ok: false,
+          saved_to_chrome: true,
+          error: synced && synced.error ? synced.error : "配置已保存到插件，但同步到 Python 服务失败。请先启动服务后再保存一次。",
+        });
+        return;
+      }
+      sendResponse({ ok: true, saved_to_chrome: true, synced_to_python: true });
       return;
     }
 
@@ -268,24 +404,51 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         serverUrl: currentServerUrl,
         concurrency: currentConcurrency,
       });
-      const health = await api("/health").catch(() => null);
-      if (health && health.stats && !health.stats.pending) {
+      const synced = await syncRunConfig(message.platforms || [], message.aiJudge).catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }));
+      if (!synced || !synced.ok) {
         sendResponse({
           ok: false,
           running: false,
-          message: "没有待执行任务。请先点“重置失败任务”，或更换/重建 Excel 任务。",
-          stats: health.stats,
+          message: synced && synced.error ? synced.error : "同步平台配置失败。",
         });
         return;
       }
+      await api("/reset-running-tasks", { method: "POST", body: JSON.stringify({}) }).catch(() => {});
+      const health = await api("/health").catch(() => null);
+      if (!health || !health.ok) {
+        sendResponse({
+          ok: false,
+          running: false,
+          message: health && health.error ? health.error : "连接不上 Python 服务，请先启动服务。",
+          stats: health ? health.stats : undefined,
+        });
+        return;
+      }
+      if (health && health.stats && !health.stats.pending) {
+        const reset = await api("/reset-all-tasks", { method: "POST", body: JSON.stringify({}) }).catch(() => null);
+        if (!reset || !reset.ok || !reset.stats || !reset.stats.pending) {
+          sendResponse({
+            ok: false,
+            running: false,
+            message: "没有待执行任务。请检查 Excel 是否有问题列，或确认当前平台列表不为空。",
+            stats: reset ? reset.stats : health.stats,
+          });
+          return;
+        }
+      }
       running = true;
       pump();
-      sendResponse({ ok: true, running, concurrency: currentConcurrency, stats: health ? health.stats : undefined });
+      sendResponse({ ok: true, running, concurrency: currentConcurrency, message: "已开始执行。", stats: health ? health.stats : undefined });
       return;
     }
 
     if (message.action === "RESET_FAILED_TASKS") {
       sendResponse(await api("/reset-failed-tasks", { method: "POST", body: JSON.stringify({}) }));
+      return;
+    }
+
+    if (message.action === "RESET_ALL_TASKS") {
+      sendResponse(await api("/reset-all-tasks", { method: "POST", body: JSON.stringify({}) }));
       return;
     }
 

@@ -3,14 +3,20 @@
   <head>
     <meta charset="utf-8">
     <style>
-      body { width: 320px; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 14px; color: #202124; }
+      body { width: 420px; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 14px; color: #202124; }
       h1 { font-size: 16px; margin: 0 0 12px; }
       label { display: block; font-size: 12px; color: #5f6368; margin: 10px 0 4px; }
       input { box-sizing: border-box; width: 100%; padding: 8px; border: 1px solid #dadce0; border-radius: 6px; }
+      input[type="checkbox"] { width: auto; }
+      label.inline { display: flex; align-items: center; gap: 8px; }
       .row { display: flex; gap: 8px; margin-top: 12px; }
       button { flex: 1; border: 0; border-radius: 6px; padding: 9px 10px; cursor: pointer; color: white; background: #1a73e8; }
       button.secondary { color: #1a73e8; background: #e8f0fe; }
       button.danger { background: #d93025; }
+      .platform-head, .platform-row { display: grid; grid-template-columns: 90px 1fr 34px; gap: 6px; align-items: center; }
+      .platform-head { color: #5f6368; font-size: 12px; margin-top: 8px; }
+      .platform-row { margin-top: 6px; }
+      button.icon { flex: none; padding: 7px 0; color: #5f6368; background: #f1f3f4; }
       pre { white-space: pre-wrap; background: #f8fafd; border: 1px solid #e8eaed; padding: 8px; border-radius: 6px; max-height: 160px; overflow: auto; font-size: 12px; }
     </style>
   </head>
@@ -22,6 +28,20 @@
     <input id="concurrency" type="number" min="1" max="5" value="3">
     <label>目标关键词（多个用逗号/顿号/or分隔）</label>
     <input id="keyword" value="贵阳商学院">
+    <label class="inline"><input id="aiJudgeEnabled" type="checkbox">启用内部 AI 判定</label>
+    <label>AI 接口地址</label>
+    <input id="aiJudgeApiUrl" placeholder="https://api.example.com/v1/chat/completions">
+    <label>AI 模型</label>
+    <input id="aiJudgeModel" placeholder="例如：gpt-4o-mini / deepseek-chat">
+    <label>API Key</label>
+    <input id="aiJudgeApiKey" type="password" placeholder="只保存在本机 Chrome 配置和本地服务">
+    <label>平台列表（只运行这里配置的平台）</label>
+    <div class="platform-head"><span>名称</span><span>URL</span><span></span></div>
+    <div id="platforms"></div>
+    <div class="row">
+      <button id="addPlatform" class="secondary">增加平台</button>
+      <button id="save" class="secondary">保存配置</button>
+    </div>
     <div class="row">
       <button id="start">开始</button>
       <button id="openLoginTabs" class="secondary">打开平台登录</button>
@@ -41,6 +61,7 @@
     </div>
     <div class="row">
       <button id="resetFailed" class="secondary">重置失败任务</button>
+      <button id="resetAll" class="danger">重置所有任务</button>
     </div>
     <label>状态</label>
     <pre id="log">等待操作</pre>

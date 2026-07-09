@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 from config import (
     ANSWER_POLL_INTERVAL,
+    ANSWER_KEYWORD_STABLE_SECONDS,
     ANSWER_STABLE_SECONDS,
     ANSWER_TIMEOUT_SECONDS,
     CONCURRENCY,
@@ -29,20 +30,27 @@ from config import (
     PORT,
     QUESTION_HEADERS,
     RESULT_EXCEL,
+    TEMP_ANSWERS_EXCEL,
     SCREENSHOT_DIR,
 )
 
 from ocr_checker import check_keyword
 from image_marker import mark_image
+from ai_judge import ai_judge, configure_ai_judge, generate_followup, get_ai_judge_config
 
 try:
-    from openpyxl import load_workbook
+    from openpyxl import Workbook, load_workbook
     from openpyxl.drawing.image import Image as ExcelImage
+    from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
 except ImportError as exc:
     raise SystemExit("缺少 openpyxl，请先安装：pip install openpyxl") from exc
 
 
 lock = threading.Lock()
+
+
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
 
 
 def now():
@@ -85,6 +93,11 @@ def init_db():
             """
         )
         conn.execute("create index if not exists idx_tasks_status on tasks(status)")
+        existing = {row[1] for row in conn.execute("pragma table_info(tasks)").fetchall()}
+        if "answer_debug" not in existing:
+            conn.execute("alter table tasks add column answer_debug text")
+        if "run_debug" not in existing:
+            conn.execute("alter table tasks add column run_debug text")
 
 
 def read_headers(sheet):
@@ -119,7 +132,88 @@ def split_keywords(value):
     return keywords or list(KEYWORDS)
 
 
-def prepare_workbook():
+def safe_platform_key(value, index=0):
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9_\-]+", "_", text)
+    text = text.strip("_")
+    return text or f"custom_{index + 1}"
+
+
+def configure_platforms(platforms):
+    if not isinstance(platforms, list) or not platforms:
+        return {"ok": False, "error": "平台列表为空"}
+
+    new_platforms = {}
+    used_keys = set()
+    for index, item in enumerate(platforms):
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        base_key = safe_platform_key(item.get("key") or item.get("name"), index)
+        key = base_key
+        duplicate_index = 2
+        while key in used_keys:
+            key = f"{base_key}_{duplicate_index}"
+            duplicate_index += 1
+        used_keys.add(key)
+        name = str(item.get("name") or key).strip()
+        existing = PLATFORMS.get(key)
+        new_platforms[key] = {
+            "name": name,
+            "column": existing.get("column") if existing else name,
+            "url": url,
+        }
+
+    if not new_platforms:
+        return {"ok": False, "error": "没有有效的平台 URL"}
+
+    PLATFORMS.clear()
+    PLATFORMS.update(new_platforms)
+    ensure_dirs()
+    seed_tasks()
+    with connect_db() as conn:
+        placeholders = ",".join("?" for _ in new_platforms)
+        conn.execute(
+            f"delete from tasks where platform not in ({placeholders})",
+            tuple(new_platforms.keys()),
+        )
+    return {"ok": True, "platforms": runtime_platforms(), "stats": stats()}
+
+
+def runtime_platforms():
+    return [
+        {"key": key, "name": item["name"], "url": item["url"]}
+        for key, item in PLATFORMS.items()
+    ]
+
+
+def clear_previous_outputs(ws, headers):
+    output_headers = {
+        "豆包", "千问", "DeepSeek", "deepseek", "元宝", "文心一言",
+        "豆包_状态", "千问_状态", "DeepSeek_状态", "deepseek_状态", "元宝_状态", "文心一言_状态",
+        "豆包_追问次数", "千问_追问次数", "DeepSeek_追问次数", "deepseek_追问次数", "元宝_追问次数", "文心一言_追问次数",
+    }
+    for item in PLATFORMS.values():
+        output_headers.add(item["column"])
+        output_headers.add(f"{item['column']}_状态")
+        output_headers.add(f"{item['column']}_追问次数")
+
+    clear_cols = []
+    for header, col in headers.items():
+      text = str(header or "").strip()
+      if text in output_headers or text.endswith("_状态") or text.endswith("_追问次数"):
+          clear_cols.append(col)
+
+    for row in range(2, ws.max_row + 1):
+        for col in clear_cols:
+            ws.cell(row=row, column=col, value=None)
+    if hasattr(ws, "_images"):
+        ws._images = []
+
+
+def prepare_workbook(clear_outputs=False):
     if not INPUT_EXCEL.exists():
         raise FileNotFoundError(f"找不到输入 Excel：{INPUT_EXCEL}")
 
@@ -129,6 +223,9 @@ def prepare_workbook():
     wb = load_workbook(RESULT_EXCEL)
     ws = wb.active
     headers = read_headers(ws)
+
+    if clear_outputs:
+        clear_previous_outputs(ws, headers)
 
     question_col = find_column(headers, QUESTION_HEADERS)
     if question_col is None:
@@ -170,9 +267,9 @@ def prepare_workbook():
     return question_col, id_col, keyword_col
 
 
-def seed_tasks():
+def seed_tasks(clear_outputs=False):
     try:
-        question_col, id_col, keyword_col = prepare_workbook()
+        question_col, id_col, keyword_col = prepare_workbook(clear_outputs=clear_outputs)
     except Exception as exc:
         print(f"任务初始化跳过：{exc}")
         print("服务会继续启动，方便先测试 Chrome 插件连接；换成包含“问题”列的 Excel 后再重启即可生成任务。")
@@ -260,6 +357,7 @@ def get_next_task():
         "max_followups": MAX_FOLLOWUPS,
         "answer_poll_interval": ANSWER_POLL_INTERVAL,
         "answer_stable_seconds": ANSWER_STABLE_SECONDS,
+        "answer_keyword_stable_seconds": ANSWER_KEYWORD_STABLE_SECONDS,
         "answer_timeout_seconds": ANSWER_TIMEOUT_SECONDS,
     }
 
@@ -277,12 +375,16 @@ def image_from_data_url(data_url, platform, task_id, matched):
     safe_task_id = task_id.replace(":", "_")
     path = SCREENSHOT_DIR / platform / f"{safe_task_id}_{suffix}.png"
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 覆盖旧截图，确保每次重新执行都得到最新图片
+    if path.exists():
+        path.unlink()
     path.write_bytes(base64.b64decode(raw))
     return path
 
 
 
-def process_screenshot_with_ocr(image_path, keywords):
+def process_screenshot_with_ocr(image_path, keywords, region_ratio=None):
     """
     截图二次检测：
     OCR识别关键词并画框
@@ -296,7 +398,8 @@ def process_screenshot_with_ocr(image_path, keywords):
     try:
         result = check_keyword(
             image_path,
-            keywords
+            keywords,
+            region_ratio=region_ratio,
         )
 
         if result.get("matched"):
@@ -417,10 +520,106 @@ def remove_images_at_cell(ws, cell_ref):
     ws._images = kept
 
 
+def anchor_image_inside_cell(img, row_number, column_index):
+    img.anchor = TwoCellAnchor(
+        editAs="twoCell",
+        _from=AnchorMarker(col=column_index - 1, row=row_number - 1),
+        to=AnchorMarker(col=column_index, row=row_number),
+    )
+    # Excel stores images as drawing objects. This keeps them visually bound to
+    # the cell area instead of behaving like an arbitrary floating picture.
+    img.object_position = 1
+
+
+def migrate_images_inside_cells(ws):
+    changed = False
+    for img in getattr(ws, "_images", []):
+        anchor = getattr(img, "anchor", None)
+        marker = getattr(anchor, "_from", None)
+        if marker is None:
+            continue
+        if isinstance(anchor, TwoCellAnchor) and getattr(anchor, "editAs", None) == "twoCell":
+            continue
+        anchor_image_inside_cell(img, int(marker.row) + 1, int(marker.col) + 1)
+        changed = True
+    return changed
+
+
+def compact_text(value, limit=None):
+    text = str(value or "").replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] if limit else text
+
+
+def write_temp_answer_sheet(payload):
+    headers = [
+        "更新时间", "task_id", "行号", "平台", "状态", "是否命中", "命中关键词",
+        "追问次数", "回答长度", "题目", "目标关键词", "回答片段", "完整回答", "每轮调试"
+    ]
+    TEMP_ANSWERS_EXCEL.parent.mkdir(parents=True, exist_ok=True)
+    if TEMP_ANSWERS_EXCEL.exists():
+        wb = load_workbook(TEMP_ANSWERS_EXCEL)
+        ws = wb.active
+        existing_headers = [ws.cell(row=1, column=i).value for i in range(1, ws.max_column + 1)]
+        if existing_headers[:len(headers)] != headers:
+            ws.insert_rows(1)
+            for col, name in enumerate(headers, 1):
+                ws.cell(row=1, column=col, value=name)
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "AI返回内容"
+        for col, name in enumerate(headers, 1):
+            ws.cell(row=1, column=col, value=name)
+
+    task_id = str(payload.get("task_id") or "")
+    target_row = None
+    for row in range(2, ws.max_row + 1):
+        if str(ws.cell(row=row, column=2).value or "") == task_id:
+            target_row = row
+            break
+    if target_row is None:
+        target_row = ws.max_row + 1
+
+    answer_text = str(payload.get("answer_text") or "")
+    run_debug = payload.get("run_debug") or []
+    matched_keywords = payload.get("matched_keywords") or []
+    keywords = payload.get("keywords") or payload.get("keyword") or ""
+    if isinstance(keywords, list):
+        keywords_text = "，".join(str(item) for item in keywords)
+    else:
+        keywords_text = str(keywords or "")
+
+    values = [
+        now(),
+        task_id,
+        payload.get("row_number"),
+        payload.get("platform"),
+        payload.get("status", "done"),
+        "是" if payload.get("matched") else "否",
+        "，".join(str(item) for item in matched_keywords),
+        int(payload.get("followup_count", 0) or 0),
+        len(answer_text),
+        compact_text(payload.get("question"), 500),
+        keywords_text,
+        compact_text(answer_text, 1000),
+        answer_text[:30000],
+        json.dumps(run_debug, ensure_ascii=False)[:30000],
+    ]
+    for col, value in enumerate(values, 1):
+        ws.cell(row=target_row, column=col, value=value)
+
+    widths = {1: 20, 2: 18, 4: 14, 6: 10, 7: 24, 10: 42, 11: 26, 12: 70, 13: 90, 14: 90}
+    for col, width in widths.items():
+        ws.column_dimensions[col_letter(ws, col)].width = max(ws.column_dimensions[col_letter(ws, col)].width or 0, width)
+    wb.save(TEMP_ANSWERS_EXCEL)
+
+
 def write_result_to_excel(result, screenshot_path):
     wb = load_workbook(RESULT_EXCEL)
     ws = wb.active
     headers = read_headers(ws)
+    migrate_images_inside_cells(ws)
 
     platform = result["platform"]
     platform_config = PLATFORMS[platform]
@@ -435,24 +634,40 @@ def write_result_to_excel(result, screenshot_path):
         status_text = f"命中：{'，'.join(matched_keywords)}"
     else:
         status_text = "命中" if matched else "未命中"
+
+    # 先清空旧状态，确保覆盖
+    ws.cell(row=row_number, column=status_col, value=None)
+    ws.cell(row=row_number, column=followup_col, value=None)
+    wb.save(RESULT_EXCEL)
+
+    # 重新加载以刷新缓存
+    wb = load_workbook(RESULT_EXCEL)
+    ws = wb.active
+    headers = read_headers(ws)
+
     ws.cell(row=row_number, column=status_col, value=status_text)
     ws.cell(row=row_number, column=followup_col, value=int(result.get("followup_count", 0)))
 
+    image_cell = f"{col_letter(ws, image_col)}{row_number}"
+    remove_images_at_cell(ws, image_cell)
+
     if screenshot_path and Path(screenshot_path).exists():
-        image_cell = f"{col_letter(ws, image_col)}{row_number}"
-        remove_images_at_cell(ws, image_cell)
-
         img = ExcelImage(str(screenshot_path))
-        img.width = 260
-        img.height = 150
-        img.anchor = image_cell
-        img.object_position = 1
-        ws.add_image(img)
+        original_width = max(1, int(getattr(img, "width", 1) or 1))
+        original_height = max(1, int(getattr(img, "height", 1) or 1))
+        max_width = 520
+        max_height = 330
+        scale = min(max_width / original_width, max_height / original_height, 1.0)
+        if original_width > max_width or original_height > max_height:
+            img.width = int(original_width * scale)
+            img.height = int(original_height * scale)
 
-        ws.row_dimensions[row_number].height = max(ws.row_dimensions[row_number].height or 0, 125)
+        ws.row_dimensions[row_number].height = max(ws.row_dimensions[row_number].height or 0, int(img.height * 0.75) + 12)
         ws.column_dimensions[col_letter(ws, image_col)].width = max(
-            ws.column_dimensions[col_letter(ws, image_col)].width or 0, 38
+            ws.column_dimensions[col_letter(ws, image_col)].width or 0, min(76, max(38, img.width / 7))
         )
+        anchor_image_inside_cell(img, row_number, image_col)
+        ws.add_image(img)
 
     wb.save(RESULT_EXCEL)
 
@@ -463,7 +678,21 @@ def submit_result(payload):
     if missing:
         raise ValueError(f"缺少字段：{missing}")
 
-    matched = bool(payload.get("matched"))
+    # V2.0：优先使用浏览器 DOM 定位结果
+    dom_location = payload.get("dom_location") or {}
+    dom_matched = bool(dom_location.get("matched"))
+    dom_keywords = dom_location.get("matched_keywords") or []
+
+    content_matched = bool(payload.get("matched"))
+    content_keywords = payload.get("matched_keywords") or []
+
+    # 如果 DOM 定位成功，优先采用 DOM 结果
+    if dom_matched and dom_keywords:
+        matched = True
+        matched_keywords = dom_keywords
+    else:
+        matched = content_matched
+        matched_keywords = content_keywords
 
     screenshot_path = image_from_data_url(
         payload.get("screenshot_data_url"),
@@ -472,41 +701,30 @@ def submit_result(payload):
         matched,
     )
 
-
-    # OCR 二次确认 + 图片标注
-    if screenshot_path:
-
-        keywords = (
-            payload.get("keywords")
-            or [KEYWORD]
-        )
-
+    if screenshot_path and payload.get("platform") == "qianwen" and matched:
+        ocr_keywords = payload.get("keywords") or matched_keywords or content_keywords
         ocr_result = process_screenshot_with_ocr(
             screenshot_path,
-            keywords
+            ocr_keywords,
+            # 千问截图只在正文区域 OCR，避开左侧栏、顶部问题气泡和底部输入框。
+            region_ratio=(0.18, 0.14, 0.96, 0.82),
         )
+        payload["ocr_debug"] = ocr_result
+        if ocr_result.get("matched") and ocr_result.get("keyword"):
+            matched = True
+            matched_keywords = list(dict.fromkeys([*matched_keywords, ocr_result.get("keyword")]))
 
-
-        if ocr_result:
-
-            payload["matched"] = ocr_result.get(
-                "matched",
-                matched
-            )
-
-            payload["matched_keywords"] = (
-                ocr_result.get(
-                    "keywords",
-                    []
-                )
-            )
-
-            matched = bool(payload["matched"])
-
+    payload["matched"] = matched
+    payload["matched_keywords"] = matched_keywords
 
     with lock:
         if screenshot_path:
             write_result_to_excel(payload, screenshot_path)
+            # 图片已嵌入 Excel，删除本地截图文件避免堆积
+            try:
+                Path(screenshot_path).unlink()
+            except Exception:
+                pass
 
         with connect_db() as conn:
             conn.execute(
@@ -517,6 +735,8 @@ def submit_result(payload):
                     followup_count = ?,
                     screenshot_path = ?,
                     answer_text = ?,
+                    answer_debug = ?,
+                    run_debug = ?,
                     error = ?,
                     updated_at = ?
                 where task_id = ?
@@ -526,6 +746,8 @@ def submit_result(payload):
                     int(payload.get("followup_count", 0)),
                     str(screenshot_path) if screenshot_path else None,
                     payload.get("answer_text", "")[:20000],
+                    json.dumps(payload.get("answer_debug") or {}, ensure_ascii=False)[:20000],
+                    json.dumps(payload.get("run_debug") or [], ensure_ascii=False)[:40000],
                     payload.get("error"),
                     now(),
                     payload["task_id"],
@@ -535,21 +757,85 @@ def submit_result(payload):
     return {"ok": True, "screenshot_path": str(screenshot_path) if screenshot_path else None}
 
 
+def judge_answer(payload):
+    answer_text = payload.get("answer_text") or ""
+    keywords = payload.get("keywords") or split_keywords(payload.get("keyword") or KEYWORD)
+    if not isinstance(keywords, list):
+        keywords = split_keywords(keywords)
+    result = ai_judge(
+        answer_text=answer_text,
+        keywords=keywords,
+        question=payload.get("question") or "",
+        platform=payload.get("platform") or "",
+    )
+    result["answer_length"] = len(str(answer_text or ""))
+    return result
+
+
+def generate_followup_prompt(payload):
+    keywords = payload.get("keywords") or split_keywords(payload.get("keyword") or KEYWORD)
+    if not isinstance(keywords, list):
+        keywords = split_keywords(keywords)
+    return generate_followup(
+        question=payload.get("question") or "",
+        answer_text=payload.get("answer_text") or "",
+        keywords=keywords,
+        followup_count=payload.get("followup_count") or 0,
+        platform=payload.get("platform") or "",
+    )
+
+
 def mark_failed(payload):
     task_id = payload.get("task_id")
     if not task_id:
         raise ValueError("缺少 task_id")
 
+    failed_payload = dict(payload)
+    failed_payload["status"] = "failed"
+    failed_payload["matched"] = False
+    write_temp_answer_sheet(failed_payload)
+
     with connect_db() as conn:
         conn.execute(
             """
             update tasks
-            set status = 'failed', error = ?, updated_at = ?
+            set status = 'failed', error = ?, answer_debug = ?, run_debug = ?, updated_at = ?
             where task_id = ?
             """,
-            (payload.get("error", "unknown error"), now(), task_id),
+            (
+                payload.get("error", "unknown error"),
+                json.dumps(payload.get("answer_debug") or {}, ensure_ascii=False)[:20000],
+                json.dumps(payload.get("run_debug") or [], ensure_ascii=False)[:40000],
+                now(),
+                task_id,
+            ),
         )
     return {"ok": True}
+
+
+def recent_debug(limit=20):
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            select task_id, row_number, platform, status, matched, followup_count,
+                   substr(answer_text, 1, 600) as answer_preview, error,
+                   answer_debug, run_debug, updated_at
+            from tasks
+            order by updated_at desc
+            limit ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        for key in ("answer_debug", "run_debug"):
+            try:
+                item[key] = json.loads(item.get(key) or "{}")
+            except Exception:
+                pass
+        items.append(item)
+    return {"ok": True, "items": items}
 
 
 def stats():
@@ -577,6 +863,15 @@ def reset_failed_tasks():
         )
         reset_count = cursor.rowcount
     return {"ok": True, "reset_count": reset_count, "stats": stats()}
+
+
+def reset_all_tasks():
+    with connect_db() as conn:
+        conn.execute("delete from tasks")
+    if RESULT_EXCEL.exists():
+        RESULT_EXCEL.unlink()
+    created = seed_tasks(clear_outputs=True)
+    return {"ok": True, "reset_count": created, "created": created, "stats": stats()}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -620,9 +915,11 @@ class Handler(BaseHTTPRequestHandler):
                     "keywords": KEYWORDS,
                     "max_followups": MAX_FOLLOWUPS,
                     "concurrency": CONCURRENCY,
-                    "platforms": PLATFORMS,
+                    "platforms": runtime_platforms(),
+                    "ai_judge": get_ai_judge_config(),
                     "answer_poll_interval": ANSWER_POLL_INTERVAL,
                     "answer_stable_seconds": ANSWER_STABLE_SECONDS,
+                    "answer_keyword_stable_seconds": ANSWER_KEYWORD_STABLE_SECONDS,
                     "answer_timeout_seconds": ANSWER_TIMEOUT_SECONDS,
                 },
             )
@@ -631,6 +928,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "task": task})
         elif path == "/test-keywords":
             self._send(200, get_test_keywords())
+        elif path == "/ai-judge-config":
+            self._send(200, get_ai_judge_config())
+        elif path == "/debug/recent":
+            query = urlparse(self.path).query
+            limit = 20
+            if query.startswith("limit="):
+                try:
+                    limit = int(query.split("=", 1)[1])
+                except Exception:
+                    pass
+            self._send(200, recent_debug(limit))
         elif path == "/test-page":
             self._send_html(
                 """
@@ -761,12 +1069,24 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._json_body()
             if path == "/submit-result":
                 self._send(200, submit_result(payload))
+            elif path == "/judge-answer":
+                self._send(200, judge_answer(payload))
+            elif path == "/generate-followup":
+                self._send(200, generate_followup_prompt(payload))
+            elif path == "/ai-judge-config":
+                self._send(200, configure_ai_judge(payload))
+            elif path == "/set-platforms":
+                self._send(200, configure_platforms(payload.get("platforms") or []))
             elif path == "/save-test-screenshot":
                 self._send(200, save_test_screenshot(payload))
             elif path == "/task-failed":
                 self._send(200, mark_failed(payload))
             elif path == "/reset-failed-tasks":
                 self._send(200, reset_failed_tasks())
+            elif path == "/reset-running-tasks":
+                self._send(200, reset_failed_tasks())
+            elif path == "/reset-all-tasks":
+                self._send(200, reset_all_tasks())
             else:
                 self._send(404, {"ok": False, "error": "not found"})
         except Exception as exc:
@@ -787,7 +1107,7 @@ def main():
     print(f"服务地址：http://{HOST}:{PORT}")
     print("先启动本服务，再在 Chrome 加载插件并点击开始。")
 
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server = ReusableThreadingHTTPServer((HOST, PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
