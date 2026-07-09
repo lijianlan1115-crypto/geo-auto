@@ -213,6 +213,62 @@ def compact_for_prompt(text, limit):
     return text if len(text) <= limit else text[-limit:]
 
 
+def infer_target_profile(keywords, question=""):
+    """给追问模型看的内部画像：帮助它靠近目标，但追问不能直接说目标名。"""
+    raw_text = " ".join([str(item or "") for item in (keywords or [])])
+    q_text = str(question or "")
+    joined = raw_text + " " + q_text
+
+    regions = []
+    for region in [
+        "贵州", "贵阳", "遵义", "六盘水", "安顺", "毕节", "铜仁", "黔南", "黔东南", "黔西南",
+        "北京", "上海", "广州", "深圳", "成都", "重庆", "杭州", "武汉", "西安", "南京", "苏州",
+    ]:
+        if region in joined and region not in regions:
+            regions.append(region)
+
+    category = "对象/机构/品牌"
+    category_clues = []
+    if re.search(r"大学|学院|学校|院校|本科|专科|职业技术", raw_text):
+        category = "院校/教育机构"
+        category_clues = ["同地区", "同层次", "同类型专业", "录取难度", "就业方向"]
+    elif re.search(r"酒店|宾馆|民宿|客栈|栖筑|电竞酒店", raw_text):
+        category = "酒店/住宿"
+        category_clues = ["同商圈", "同价位", "同档次", "入住体验", "交通位置"]
+    elif re.search(r"公司|科技|集团|有限|企业|工作室|服务商", raw_text):
+        category = "公司/服务商"
+        category_clues = ["本地交付", "客户案例", "行业经验", "售后响应", "长期合作"]
+    elif re.search(r"医院|门诊|诊所|科室", raw_text):
+        category = "医疗机构"
+        category_clues = ["同地区", "专科能力", "口碑", "就诊便利", "服务能力"]
+    elif re.search(r"景区|公园|古镇|博物馆|旅游|度假", raw_text):
+        category = "文旅/景区"
+        category_clues = ["同城市", "游玩场景", "交通便利", "口碑", "适合人群"]
+    elif re.search(r"产品|系统|平台|软件|APP|工具", raw_text + q_text):
+        category = "产品/软件/平台"
+        category_clues = ["功能匹配", "使用场景", "价格", "交付服务", "替代方案"]
+
+    return {
+        "target_keywords_internal": keywords,
+        "category": category,
+        "regions": regions,
+        "category_clues": category_clues,
+        "guidance": "追问要把被测AI拉回原问题，并逐步增加与目标对象相同的地区、类型、层次、场景或服务能力约束，让它更可能自然列出目标对象。",
+    }
+
+
+def followup_strategy(followup_count):
+    try:
+        count = int(followup_count or 0)
+    except Exception:
+        count = 0
+    if count <= 0:
+        return "第一轮追问：要求补充上一轮遗漏的具体名称，并强调同地区/同类型/同场景，不要泛泛扩展。"
+    if count == 1:
+        return "第二轮追问：进一步收窄到目标对象画像里的地区、类别、层次或服务能力，让被测AI重新核对是否有遗漏。"
+    return "第三轮追问：要求只给新增候选，并按最贴近原问题条件的对象核对遗漏，避免继续发散。"
+
+
 def parse_followup_content(content):
     text = str(content or "").strip()
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I).strip()
@@ -279,34 +335,44 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
     for item in conversation[-8:]:
         safe_conversation.append({"role": item["role"], "content": redact_forbidden_terms(compact_for_prompt(item["content"], 1800), keywords)})
 
+    target_profile = infer_target_profile(keywords, previous_question)
     structured_input = {
-        "question": redact_forbidden_terms(compact_for_prompt(previous_question, 700), keywords),
-        "answer": redact_forbidden_terms(compact_for_prompt(real_answer, 2200), keywords),
+        "question": redact_forbidden_terms(compact_for_prompt(previous_question, 900), keywords),
+        "answer": redact_forbidden_terms(compact_for_prompt(real_answer, 2400), keywords),
         "platform": real_platform,
         "conversation": safe_conversation,
         "followup_count": followup_count,
         "forbidden_terms": forbidden_terms,
-        "task": "根据 conversation 中最后一条 assistant 真实回答，生成一句自然追问。不要回答问题本身。",
+        "target_profile_internal": target_profile,
+        "strategy": followup_strategy(followup_count),
+        "task": "生成一句目标导向追问：目标是让被测AI在下一轮回答中更可能自然提到 target_profile_internal.target_keywords_internal 里的对象，但追问文本本身绝不能出现这些词。",
         "rules": [
-            "必须根据最后一条assistant真实回答生成，不能泛泛套模板。",
-            "如果最后一条回答已经很完整，就从其内容中选择一个自然延伸角度继续问。",
+            "必须围绕原始问题继续问，不能换话题，不能越问越宽泛。",
+            "必须根据最后一条assistant真实回答中的缺口追问，同时叠加目标画像里的地区、类别、层次、场景或服务能力约束。",
+            "追问要像普通用户自然追问，不能暴露测试、命中、目标词、关键词、GEO检测等意图。",
             "不要出现任何forbidden_terms中的词或其明显变体。",
             "不能直接给出目标关键词、目标对象名称、简称或别名。",
-            "不能包含测试、命中、目标词、关键词、GEO检测等元信息。",
+            "优先问：是否遗漏了同地区/同类型/同定位/同场景的具体名称，而不是泛泛问更多信息。",
+            "如果上一轮回答已经列了很多对象，就要求只补充新增且最贴近原条件的候选。",
             "不能输出代码、SQL、JSON、HTML、操作步骤、列表或多条问题。",
-            "只能问一个方向，必须像普通用户继续追问。",
-            "长度控制在40到120个中文字符。",
+            "只能问一个方向，40到120个中文字符。",
         ],
+        "bad_examples": [
+            "还有别的吗？",
+            "能不能再详细介绍一下？",
+            "请继续补充更多选择。",
+        ],
+        "good_pattern": "除了刚才这些，是否还遗漏了【同地区/同类型/同场景】且【更贴近原问题条件】的具体名称？请只补充新增候选。",
         "return_schema": {"prompt": "下一轮追问文本", "intent": "为什么这样追问，20字以内"},
     }
 
     payload = {
         "model": RUNTIME_CONFIG.get("model"),
         "messages": [
-            {"role": "system", "content": "你是GEO反馈检测追问生成器。你会收到结构化输入：question、answer、platform、conversation。你必须判断answer是否是真实可用回答，并基于conversation最后一条assistant回答生成一句自然追问。追问不能出现目标关键词、目标对象名称、简称或别名。只返回严格JSON。"},
+            {"role": "system", "content": "你是GEO反馈检测追问生成器。你会收到结构化输入：question、answer、conversation、target_profile_internal。你要用内部目标画像设计追问，让被测AI更可能自然提到目标对象；但你输出的追问绝不能出现目标对象名称、简称或别名。只返回严格JSON。"},
             {"role": "user", "content": json.dumps(structured_input, ensure_ascii=False)},
         ],
-        "temperature": 0.45,
+        "temperature": 0.28,
         "response_format": {"type": "json_object"},
     }
 
@@ -333,8 +399,8 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
     if not prompt:
         return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问为空", "real_answer_valid": True, "conversation_turns": len(conversation)}
     if contains_forbidden_keyword(prompt, keywords):
-        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问包含目标关键词或别名，已停止追问", "real_answer_valid": True, "conversation_turns": len(conversation)}
+        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问包含目标关键词或别名，已停止追问", "real_answer_valid": True, "conversation_turns": len(conversation), "target_profile": target_profile}
     if len(prompt) > 160 or "\n" in prompt:
-        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问格式不合规，已停止追问", "real_answer_valid": True, "conversation_turns": len(conversation)}
+        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问格式不合规，已停止追问", "real_answer_valid": True, "conversation_turns": len(conversation), "target_profile": target_profile}
 
-    return {"ok": True, "prompt": prompt, "source": "ai", "intent": intent, "api_mode": api_mode, "real_answer_valid": True, "conversation_turns": len(conversation), "used_structured_context": True}
+    return {"ok": True, "prompt": prompt, "source": "ai", "intent": intent, "api_mode": api_mode, "real_answer_valid": True, "conversation_turns": len(conversation), "used_structured_context": True, "target_directed": True, "target_profile": {"category": target_profile.get("category"), "regions": target_profile.get("regions"), "category_clues": target_profile.get("category_clues")}}
