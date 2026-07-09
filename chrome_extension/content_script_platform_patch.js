@@ -33,6 +33,44 @@
     return task;
   }
 
+  function normalizePlatformRows() {
+    const root = document.getElementById("geo-auto-root");
+    const shadow = root && root.shadowRoot;
+    if (!shadow) return;
+
+    shadow.querySelectorAll(".platform-row").forEach((row, index) => {
+      const nameInput = row.querySelector("[data-platform-name]");
+      const urlInput = row.querySelector("[data-platform-url]");
+      const name = nameInput ? nameInput.value : "";
+      const url = urlInput ? urlInput.value : "";
+      const current = row.dataset.platformKey || `custom_${index + 1}`;
+      const canonical = canonicalPlatformKey(current, name, url);
+
+      if (canonical && canonical !== current) {
+        row.dataset.originalPlatformKey = current;
+        row.dataset.platformKey = canonical;
+      }
+    });
+  }
+
+  function installPanelNormalizer() {
+    const root = document.getElementById("geo-auto-root");
+    const shadow = root && root.shadowRoot;
+    if (!shadow || shadow.__geoPlatformRowsNormalized) return;
+    shadow.__geoPlatformRowsNormalized = true;
+
+    normalizePlatformRows();
+    shadow.addEventListener("input", normalizePlatformRows, true);
+    shadow.addEventListener("change", normalizePlatformRows, true);
+    shadow.addEventListener("click", () => setTimeout(normalizePlatformRows, 0), true);
+
+    const platformsBox = shadow.querySelector("[data-platforms]");
+    if (platformsBox && window.MutationObserver) {
+      const observer = new MutationObserver(() => normalizePlatformRows());
+      observer.observe(platformsBox, { childList: true, subtree: true, attributes: true });
+    }
+  }
+
   function wrapRunner() {
     if (!window.geoAutomationRun || window.__geoPlatformPatchWrapped) return;
     const originalRun = window.geoAutomationRun;
@@ -42,7 +80,14 @@
     window.__geoPlatformPatchWrapped = true;
   }
 
-  wrapRunner();
-  setTimeout(wrapRunner, 0);
-  setTimeout(wrapRunner, 500);
+  function installAll() {
+    wrapRunner();
+    installPanelNormalizer();
+    normalizePlatformRows();
+  }
+
+  installAll();
+  setTimeout(installAll, 0);
+  setTimeout(installAll, 500);
+  setInterval(installAll, 2000);
 })();
