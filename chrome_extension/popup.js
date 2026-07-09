@@ -32,6 +32,31 @@ async function send(action, payload = {}) {
   return chrome.runtime.sendMessage({ action, ...payload });
 }
 
+async function postServerJson(serverUrl, path, payload) {
+  const response = await fetch(`${serverUrl}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  const text = await response.text();
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch (error) {
+    data = { ok: false, error: text || response.statusText };
+  }
+  if (!response.ok) return { ok: false, error: data.error || `HTTP ${response.status}`, raw: data };
+  return data;
+}
+
+function splitKeywords(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item || "").trim()).filter(Boolean);
+  return String(value || "")
+    .split(/[\n,，、;；|/]+|\s+or\s+|\s+OR\s+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function defaultPlatforms(urlOverride = null) {
   return Object.entries(DEFAULT_PLATFORM_URLS).map(([key, url]) => ({
     key,
@@ -65,7 +90,7 @@ function renderPlatforms(platforms) {
 function readForm() {
   const serverUrl = serverUrlInput.value.replace(/\/$/, "");
   const concurrency = Number(concurrencyInput.value || 3);
-  const keyword = keywordInput.value.trim() || "贵阳商学院";
+  const keyword = keywordInput.value.trim();
   const platforms = [];
   const platformUrls = {};
   platformsEl.querySelectorAll(".platform-row").forEach((row, index) => {
@@ -98,6 +123,53 @@ document.getElementById("health").addEventListener("click", async () => {
 
 document.getElementById("save").addEventListener("click", async () => {
   log(await saveSettings());
+});
+
+document.getElementById("testFollowup").addEventListener("click", async () => {
+  const form = readForm();
+  const saved = await saveSettings();
+  if (!saved || !saved.ok) {
+    log(saved || { ok: false, error: "保存配置失败，不能测试AI追问" });
+    return;
+  }
+
+  const keywords = splitKeywords(form.keyword);
+  if (!keywords.length) {
+    log({ ok: false, error: "请先填写目标关键词，再测试AI追问。测试追问会自动禁止出现该关键词。" });
+    return;
+  }
+
+  const sampleQuestion = "贵州有哪些适合企业合作的软件服务公司？";
+  const sampleAnswer = "如果你想选择贵州本地的软件服务公司，可以从产品成熟度、客户案例、交付能力、售后响应速度和行业经验几个角度来比较。也可以优先看是否有本地化团队、实际项目落地经验、报价透明度以及后续维护能力。";
+  const result = await postServerJson(form.serverUrl, "/generate-followup", {
+    keywords,
+    platform: "本地AI追问测试",
+    followup_count: 0,
+    answer_text: sampleAnswer,
+    question: {
+      question: sampleQuestion,
+      answer: sampleAnswer,
+      platform: "本地AI追问测试",
+      conversation: [
+        { role: "user", content: sampleQuestion },
+        { role: "assistant", content: sampleAnswer },
+      ],
+    },
+  });
+
+  log({
+    title: "AI追问测试结果",
+    ok: Boolean(result && result.ok),
+    source: result && result.source,
+    prompt: result && result.prompt,
+    reason: result && result.reason,
+    intent: result && result.intent,
+    api_mode: result && result.api_mode,
+    real_answer_valid: result && result.real_answer_valid,
+    used_structured_context: result && result.used_structured_context,
+    conversation_turns: result && result.conversation_turns,
+    raw: result,
+  });
 });
 
 document.getElementById("testShot").addEventListener("click", async () => {
