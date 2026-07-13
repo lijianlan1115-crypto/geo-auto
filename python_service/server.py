@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import config as service_config
 from config import (
     ANSWER_POLL_INTERVAL,
     ANSWER_KEYWORD_STABLE_SECONDS,
@@ -69,11 +70,21 @@ def save_workbook_atomic(workbook, target_path):
     target = Path(target_path)
     temp = target.with_name(f".{target.stem}.{os.getpid()}.tmp.xlsx")
     try:
-        workbook.save(temp)
-        os.replace(temp, target)
+        for attempt in range(3):
+            try:
+                workbook.save(temp)
+                os.replace(temp, target)
+                break
+            except PermissionError as exc:
+                if attempt == 2:
+                    raise PermissionError(
+                        f"无法写入结果文件：{target}。请关闭 Excel/WPS、资源管理器预览窗格或同步工具后重试。"
+                    ) from exc
+                time.sleep(0.5)
     finally:
         if temp.exists():
             temp.unlink()
+        workbook.close()
 
 
 def connect_db():
@@ -1149,7 +1160,7 @@ def input_matches_existing_progress(input_path):
 
 
 def configure_input_excel(input_path):
-    global INPUT_EXCEL
+    global INPUT_EXCEL, RESULT_EXCEL
 
     new_path = Path(input_path).expanduser().resolve()
     if not new_path.exists():
@@ -1166,17 +1177,11 @@ def configure_input_excel(input_path):
             "stats": stats(),
         }
 
-    archive_path = None
+    previous_result = None
     if RESULT_EXCEL.exists():
-        archive_dir = OUTPUT_DIR / "archive"
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        archive_path = archive_dir / f"result_{stamp}.xlsx"
-        suffix = 1
-        while archive_path.exists():
-            archive_path = archive_dir / f"result_{stamp}_{suffix}.xlsx"
-            suffix += 1
-        shutil.move(str(RESULT_EXCEL), str(archive_path))
+        previous_result = RESULT_EXCEL
+        RESULT_EXCEL = create_result_excel_path(OUTPUT_DIR)
+        service_config.RESULT_EXCEL = RESULT_EXCEL
 
     INPUT_EXCEL = new_path
     with lock, connect_db() as conn:
@@ -1185,8 +1190,43 @@ def configure_input_excel(input_path):
     return {
         "ok": True,
         "input_excel": str(INPUT_EXCEL),
-        "archived_result": str(archive_path) if archive_path else "",
+        "previous_result": str(previous_result) if previous_result else "",
+        "result_excel": str(RESULT_EXCEL),
         "resumed_existing_progress": False,
+    }
+
+
+def create_result_excel_path(output_dir):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    path = output_dir / f"GEO反馈结果_{stamp}.xlsx"
+    suffix = 1
+    while path.exists():
+        path = output_dir / f"GEO反馈结果_{stamp}_{suffix}.xlsx"
+        suffix += 1
+    return path
+
+
+def configure_output_dir(output_dir):
+    global OUTPUT_DIR, SCREENSHOT_DIR, RESULT_EXCEL, TEMP_ANSWERS_EXCEL, DB_PATH
+
+    OUTPUT_DIR = Path(output_dir).expanduser().resolve()
+    SCREENSHOT_DIR = OUTPUT_DIR / "screenshots"
+    RESULT_EXCEL = create_result_excel_path(OUTPUT_DIR)
+    TEMP_ANSWERS_EXCEL = OUTPUT_DIR / "ai返回内容临时表.xlsx"
+    DB_PATH = OUTPUT_DIR / "progress.sqlite"
+
+    service_config.OUTPUT_DIR = OUTPUT_DIR
+    service_config.SCREENSHOT_DIR = SCREENSHOT_DIR
+    service_config.RESULT_EXCEL = RESULT_EXCEL
+    service_config.TEMP_ANSWERS_EXCEL = TEMP_ANSWERS_EXCEL
+    service_config.DB_PATH = DB_PATH
+    ensure_dirs()
+    return {
+        "ok": True,
+        "output_dir": str(OUTPUT_DIR),
+        "result_excel": str(RESULT_EXCEL),
     }
 
 
