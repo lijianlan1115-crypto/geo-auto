@@ -335,16 +335,17 @@
         while (!matched && followupCount < Number(task.max_followups || 3)) {
           const followup = await nextFollowupPromise;
           if (!followup || !followup.prompt) {
+            const failureReason = followup && followup.reason ? followup.reason : "AI没有生成可用追问";
             runDebug.push({
               round: followupCount + 1,
-              type: "followup_skipped",
+              type: "followup_failed",
               prompt_source: followup && followup.source ? followup.source : "error",
-              prompt_reason: followup && followup.reason ? followup.reason : "AI没有生成可用追问，停止继续追问",
+              prompt_reason: failureReason,
               real_answer_valid: followup && followup.real_answer_valid,
               conversation_turns: conversation.length,
               used_structured_context: followup && followup.used_structured_context,
             });
-            break;
+            throw new Error(`AI追问生成失败：${failureReason}`);
           }
 
           const prompt = followup.prompt;

@@ -75,7 +75,7 @@ async function effectiveTaskKeywords(task) {
   const data = await chrome.storage.local.get(["keyword"]);
   const taskKeywords = splitKeywords(task.keywords || task.keyword);
   const configuredKeywords = splitKeywords(data.keyword);
-  return taskKeywords.length ? taskKeywords : configuredKeywords;
+  return configuredKeywords.length ? configuredKeywords : taskKeywords;
 }
 
 async function runOneTask(task) {
@@ -98,7 +98,7 @@ async function runOneTask(task) {
 
     const keywords = await effectiveTaskKeywords(task);
     if (!keywords.length) {
-      throw new Error("缺少目标关键词：请在 Excel 关键词列或插件面板中填写目标关键词后再开始。");
+      throw new Error("缺少目标关键词：请在插件面板或 Excel 关键词列中填写目标关键词后再开始。");
     }
     task.keywords = keywords;
     task.keyword = keywords[0];
@@ -125,12 +125,17 @@ async function runOneTask(task) {
 
     const [{ result }] = scriptResult;
 
-    if (!result || result.error) {
-      const err = new Error(result && result.error ? result.error : "content script did not return result");
-      if (result) {
-        err.answer_debug = result.answer_debug || null;
-        err.run_debug = result.run_debug || [];
-      }
+    if (!result) {
+      throw new Error("content script did not return result");
+    }
+
+    if (!result.screenshot_data_url && tab && tab.windowId) {
+      result.screenshot_data_url = await captureTabScreenshot(tab.windowId);
+    }
+    if (!result.screenshot_data_url) {
+      const err = new Error(result.error || "截图失败：未获取到页面截图");
+      err.answer_debug = result.answer_debug || null;
+      err.run_debug = result.run_debug || [];
       throw err;
     }
 
@@ -154,6 +159,33 @@ async function runOneTask(task) {
       }),
     });
   } catch (error) {
+    let fallbackSubmitted = false;
+    if (tab && tab.windowId) {
+      const fallbackScreenshot = await captureTabScreenshot(tab.windowId).catch(() => null);
+      if (fallbackScreenshot) {
+        const submitted = await api("/submit-result", {
+          method: "POST",
+          body: JSON.stringify({
+            task_id: task.task_id,
+            row_number: task.row_number,
+            row_id: task.row_id,
+            platform: task.platform,
+            matched: false,
+            matched_keywords: [],
+            followup_count: 0,
+            answer_text: "",
+            error: String(error && error.message ? error.message : error),
+            screenshot_data_url: fallbackScreenshot,
+            dom_location: null,
+            answer_debug: error && error.answer_debug ? error.answer_debug : null,
+            run_debug: error && error.run_debug ? error.run_debug : [],
+            keywords: task.keywords || [],
+          }),
+        }).catch(() => null);
+        fallbackSubmitted = Boolean(submitted && submitted.ok);
+      }
+    }
+    if (fallbackSubmitted) return;
     await api("/task-failed", {
       method: "POST",
       body: JSON.stringify({
@@ -184,10 +216,15 @@ async function testScreenshot(keywordText) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab || !tab.id) throw new Error("找不到当前标签页");
 
-  const excelKeywords = await api("/test-keywords").catch(() => null);
-  const keywords = excelKeywords && excelKeywords.ok && excelKeywords.keywords && excelKeywords.keywords.length
-    ? excelKeywords.keywords
-    : splitKeywords(keywordText);
+  const configuredKeywords = splitKeywords(keywordText);
+  const excelKeywords = configuredKeywords.length
+    ? null
+    : await api("/test-keywords").catch(() => null);
+  const keywords = configuredKeywords.length
+    ? configuredKeywords
+    : (excelKeywords && excelKeywords.ok && excelKeywords.keywords && excelKeywords.keywords.length
+      ? excelKeywords.keywords
+      : []);
 
   if (!keywords.length) throw new Error("缺少测试关键词，请先在插件面板或 Excel 关键词列中填写。 ");
 
@@ -215,7 +252,7 @@ async function testScreenshot(keywordText) {
   return {
     ...saved,
     keywords,
-    keyword_source: excelKeywords ? excelKeywords.source : "input",
+    keyword_source: configuredKeywords.length ? "plugin" : (excelKeywords ? excelKeywords.source : "missing"),
     keyword_message: excelKeywords ? excelKeywords.message : undefined,
     excel_row_number: excelKeywords ? excelKeywords.row_number : undefined,
     dom_location: result && result.dom_location ? result.dom_location : null,
@@ -433,20 +470,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
       if (health && health.stats && !health.stats.pending) {
-        const reset = await api("/reset-all-tasks", { method: "POST", body: JSON.stringify({}) }).catch(() => null);
-        if (!reset || !reset.ok || !reset.stats || !reset.stats.pending) {
-          sendResponse({
-            ok: false,
-            running: false,
-            message: "没有待执行任务。请检查 Excel 是否有问题列，或确认当前平台列表不为空。",
-            stats: reset ? reset.stats : health.stats,
-          });
-          return;
-        }
+        const stats = health.stats || {};
+        sendResponse({
+          ok: false,
+          running: false,
+          message: `没有待执行任务。已完成 ${Number(stats.done || 0)}，失败 ${Number(stats.failed || 0)}。失败项可使用“重置失败任务”后继续。`,
+          stats,
+        });
+        return;
       }
       running = true;
       pump();
-      sendResponse({ ok: true, running, concurrency: currentConcurrency, message: "已开始执行。", stats: health ? health.stats : undefined });
+      const stats = health && health.stats ? health.stats : {};
+      sendResponse({
+        ok: true,
+        running,
+        concurrency: currentConcurrency,
+        message: `已开始 / 继续执行：已完成 ${Number(stats.done || 0)}，待执行 ${Number(stats.pending || 0)}，失败 ${Number(stats.failed || 0)}。`,
+        stats,
+      });
       return;
     }
 

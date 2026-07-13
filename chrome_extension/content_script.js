@@ -74,7 +74,7 @@ async function runtimeMessage(message) {
 
 function splitKeywords(value) {
   if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
-  return String(value || "贵阳商学院")
+  return String(value || "")
     .split(/[\n,，、;；|/]+|\s+or\s+|\s+OR\s+/)
     .map((item) => item.trim())
     .filter(Boolean);
@@ -193,7 +193,7 @@ function injectFloatingPanel() {
       <label>并发数</label>
       <input data-key="concurrency" type="number" min="1" max="5" value="3">
       <label>目标关键词（多个用逗号/顿号/or分隔）</label>
-      <input data-key="keyword" value="贵阳商学院">
+      <input data-key="keyword" placeholder="填写后优先于 Excel 每行关键词">
       <label class="inline"><input data-key="aiJudgeEnabled" type="checkbox">启用内部 AI 判定（追问生成只需填写下面的 AI 配置）</label>
       <label>AI 接口地址（用于追问生成/内部判定）</label>
       <input data-key="aiJudgeApiUrl" placeholder="例如：https://api.example.com/v1/chat/completions">
@@ -208,17 +208,12 @@ function injectFloatingPanel() {
         <button class="action secondary" data-action="addPlatform">增加平台</button>
       </div>
       <div class="row">
-        <button class="action secondary" data-action="mockUrls">使用本地模拟平台</button>
-        <button class="action secondary" data-action="realUrls">使用真实AI平台</button>
-      </div>
-      <div class="row">
         <button class="action" data-action="save">保存配置</button>
         <button class="action secondary" data-action="health">检查服务</button>
       </div>
       <div class="row">
-        <button class="action" data-action="start">开始</button>
+        <button class="action" data-action="start">开始 / 继续</button>
         <button class="action secondary" data-action="openLoginTabs">打开平台登录</button>
-        <button class="action secondary" data-action="testShot">测试截图</button>
         <button class="action danger" data-action="stop">停止</button>
       </div>
       <div class="row">
@@ -264,13 +259,37 @@ function injectFloatingPanel() {
   renderPlatforms(DEFAULT_PLATFORMS);
 
   const setStatus = (value) => {
-    status.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+    if (typeof value === "string") {
+      status.textContent = value;
+      return;
+    }
+    if (!value || typeof value !== "object") {
+      status.textContent = String(value || "等待操作");
+      return;
+    }
+    if (value.ok === false) {
+      status.textContent = `操作失败：${value.error || value.message || "请重试"}`;
+      return;
+    }
+    if (value.message) {
+      status.textContent = value.message;
+      return;
+    }
+    if (value.saved_to_chrome) {
+      status.textContent = "配置已保存";
+      return;
+    }
+    if (value.stats) {
+      status.textContent = `服务已连接 · 待执行 ${Number(value.stats.pending || 0)} · 已完成 ${Number(value.stats.done || 0)}`;
+      return;
+    }
+    status.textContent = value.ok ? "操作成功" : JSON.stringify(value, null, 2);
   };
 
   const readForm = () => {
     const serverUrl = shadow.querySelector('[data-key="serverUrl"]').value.replace(/\/$/, "");
     const concurrency = Number(shadow.querySelector('[data-key="concurrency"]').value || 3);
-    const keyword = shadow.querySelector('[data-key="keyword"]').value.trim() || "贵阳商学院";
+    const keyword = shadow.querySelector('[data-key="keyword"]').value.trim();
     const aiJudge = {
       enabled: shadow.querySelector('[data-key="aiJudgeEnabled"]').checked,
       api_url: shadow.querySelector('[data-key="aiJudgeApiUrl"]').value.trim(),
@@ -295,7 +314,7 @@ function injectFloatingPanel() {
     if (!settings || !settings.ok) return;
     shadow.querySelector('[data-key="serverUrl"]').value = settings.serverUrl || DEFAULT_SERVER_URL;
     shadow.querySelector('[data-key="concurrency"]').value = settings.concurrency || 3;
-    shadow.querySelector('[data-key="keyword"]').value = settings.keyword || "贵阳商学院";
+    shadow.querySelector('[data-key="keyword"]').value = settings.keyword || "";
     const aiJudge = settings.aiJudge || {};
     shadow.querySelector('[data-key="aiJudgeEnabled"]').checked = Boolean(aiJudge.enabled);
     shadow.querySelector('[data-key="aiJudgeApiUrl"]').value = aiJudge.api_url || "";
@@ -325,16 +344,6 @@ function injectFloatingPanel() {
     const form = readForm();
     if (action === "save") {
       setStatus(await runtimeMessage({ action: "SAVE_SETTINGS", ...form }));
-    }
-    if (action === "mockUrls") {
-      renderPlatforms(DEFAULT_PLATFORMS.map((item) => ({ ...item, url: "http://127.0.0.1:8765/mock-platform" })));
-      const mockForm = readForm();
-      setStatus(await runtimeMessage({ action: "SAVE_SETTINGS", ...mockForm }));
-    }
-    if (action === "realUrls") {
-      renderPlatforms(DEFAULT_PLATFORMS);
-      const realForm = readForm();
-      setStatus(await runtimeMessage({ action: "SAVE_SETTINGS", ...realForm }));
     }
     if (action === "addPlatform") {
       const current = readForm().platforms;
@@ -370,14 +379,6 @@ function injectFloatingPanel() {
         return;
       }
       setStatus(await runtimeMessage({ action: "OPEN_LOGIN_TABS" }));
-    }
-    if (action === "testShot") {
-      const saved = await runtimeMessage({ action: "SAVE_SETTINGS", ...form });
-      if (!saved || !saved.ok) {
-        setStatus(saved || { ok: false, error: "保存配置失败" });
-        return;
-      }
-      setStatus(await runtimeMessage({ action: "TEST_SCREENSHOT", serverUrl: form.serverUrl, keyword: form.keyword }));
     }
     if (action === "stop") {
       setStatus(await runtimeMessage({ action: "STOP" }));
@@ -2351,7 +2352,7 @@ async function runPlatformTask(task) {
   let domLocation = null;
   let lastPrompt = task.question;
   const runDebug = [];
-  const keywords = task.keywords && task.keywords.length ? task.keywords : [task.keyword || "贵阳商学院"];
+  const keywords = task.keywords && task.keywords.length ? task.keywords : [task.keyword || ""].filter(Boolean);
 
   let previousText = getAnswerText(task.platform);
   await sendPrompt(task.platform, task.question);

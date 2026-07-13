@@ -3,71 +3,177 @@
   <head>
     <meta charset="utf-8">
     <style>
-      body { width: 420px; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 14px; color: #202124; }
-      h1 { font-size: 16px; margin: 0 0 12px; }
-      label { display: block; font-size: 12px; color: #5f6368; margin: 10px 0 4px; }
-      input { box-sizing: border-box; width: 100%; padding: 8px; border: 1px solid #dadce0; border-radius: 6px; }
-      input[type="checkbox"] { width: auto; }
-      label.inline { display: flex; align-items: center; gap: 8px; }
-      .row { display: flex; gap: 8px; margin-top: 12px; }
-      button { flex: 1; border: 0; border-radius: 6px; padding: 9px 10px; cursor: pointer; color: white; background: #1a73e8; }
-      button.secondary { color: #1a73e8; background: #e8f0fe; }
-      button.danger { background: #d93025; }
-      .platform-head, .platform-row { display: grid; grid-template-columns: 90px 1fr 34px; gap: 6px; align-items: center; }
-      .platform-head { color: #5f6368; font-size: 12px; margin-top: 8px; }
+      :root {
+        color-scheme: light;
+        --bg: #f6f7f9;
+        --panel: #ffffff;
+        --text: #1f2937;
+        --muted: #667085;
+        --line: #d9dee7;
+        --primary: #2563eb;
+        --primary-weak: #eaf1ff;
+        --danger: #c2410c;
+        --danger-weak: #fff1eb;
+        --ok: #15803d;
+        --shadow: 0 10px 28px rgba(31, 41, 55, 0.12);
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        width: 460px;
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 13px;
+      }
+
+      .shell { padding: 14px; }
+
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      h1 { margin: 0; font-size: 18px; line-height: 1.2; }
+      .subtitle { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+      .badge { flex: none; border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px; background: #fff; color: var(--muted); font-size: 12px; }
+      .badge.ok { border-color: #bbf7d0; background: #ecfdf3; color: var(--ok); }
+      .badge.warn { border-color: #fed7aa; background: #fff7ed; color: var(--danger); }
+
+      section {
+        background: var(--panel);
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        padding: 12px;
+        margin-bottom: 10px;
+      }
+
+      .section-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 10px;
+        font-weight: 650;
+      }
+
+      .hint { color: var(--muted); font-size: 12px; font-weight: 400; }
+      label { display: block; color: var(--muted); font-size: 12px; margin: 9px 0 5px; }
+      input { width: 100%; min-height: 34px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--text); outline: none; }
+      input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12); }
+      input[type="checkbox"] { width: 16px; min-height: 16px; accent-color: var(--primary); }
+      label.inline { display: flex; align-items: center; gap: 8px; color: var(--text); }
+
+      .grid-2 { display: grid; grid-template-columns: 1fr 96px; gap: 8px; }
+      .row { display: flex; gap: 8px; margin-top: 8px; }
+      .row.wrap { flex-wrap: wrap; }
+      button { flex: 1; min-height: 34px; border: 0; border-radius: 6px; padding: 8px 10px; cursor: pointer; color: #fff; background: var(--primary); font-weight: 600; }
+      button:hover { filter: brightness(0.97); }
+      button:active { transform: translateY(1px); }
+      button.secondary { color: var(--primary); background: var(--primary-weak); }
+      button.neutral { color: #344054; background: #eef2f6; }
+      button.danger { color: var(--danger); background: var(--danger-weak); }
+      button:disabled { cursor: not-allowed; opacity: 0.58; transform: none; }
+
+      .platform-head, .platform-row { display: grid; grid-template-columns: 86px 1fr 32px; gap: 6px; align-items: center; }
+      .platform-head { color: var(--muted); font-size: 12px; margin-top: 2px; }
       .platform-row { margin-top: 6px; }
-      button.icon { flex: none; padding: 7px 0; color: #5f6368; background: #f1f3f4; }
-      pre { white-space: pre-wrap; background: #f8fafd; border: 1px solid #e8eaed; padding: 8px; border-radius: 6px; max-height: 160px; overflow: auto; font-size: 12px; }
+      button.icon { flex: none; min-height: 32px; padding: 0; color: #475467; background: #eef2f6; font-size: 18px; line-height: 1; }
+
+      pre {
+        margin: 0;
+        white-space: pre-wrap;
+        background: #0f172a;
+        border: 1px solid #1e293b;
+        color: #dbeafe;
+        padding: 10px;
+        border-radius: 6px;
+        max-height: 150px;
+        overflow: auto;
+        font-size: 12px;
+        line-height: 1.45;
+      }
     </style>
   </head>
   <body>
-    <h1>GEO反馈自动化</h1>
-    <label>Python服务地址</label>
-    <input id="serverUrl" value="http://127.0.0.1:8765">
-    <label>并发数</label>
-    <input id="concurrency" type="number" min="1" max="5" value="3">
-    <label>目标关键词（多个用逗号/顿号/or分隔）</label>
-    <input id="keyword" placeholder="例如：目标品牌A、某某酒店、某某学校">
-    <label class="inline"><input id="aiJudgeEnabled" type="checkbox">启用内部 AI 判定</label>
-    <label>AI 接口地址</label>
-    <input id="aiJudgeApiUrl" placeholder="https://api.example.com/v1/chat/completions">
-    <label>AI 模型</label>
-    <input id="aiJudgeModel" placeholder="例如：gpt-4o-mini / deepseek-chat">
-    <label>API Key</label>
-    <input id="aiJudgeApiKey" type="password" placeholder="只保存在本机 Chrome 配置和本地服务">
-    <label>平台列表（只运行这里配置的平台）</label>
-    <div class="platform-head"><span>名称</span><span>URL</span><span></span></div>
-    <div id="platforms"></div>
-    <div class="row">
-      <button id="addPlatform" class="secondary">增加平台</button>
-      <button id="save" class="secondary">保存配置</button>
+    <div class="shell">
+      <header>
+        <div>
+          <h1>GEO反馈自动化</h1>
+          <p class="subtitle">批量提问、追问、截图并写回 Excel</p>
+        </div>
+        <span id="serviceBadge" class="badge">服务未检查</span>
+      </header>
+
+      <section>
+        <div class="section-title">本地服务 <span class="hint">Windows 可用免 Python 服务包</span></div>
+        <div class="grid-2">
+          <div>
+            <label>服务地址</label>
+            <input id="serverUrl" value="http://127.0.0.1:8765">
+          </div>
+          <div>
+            <label>并发数</label>
+            <input id="concurrency" type="number" min="1" max="5" value="3">
+          </div>
+        </div>
+        <div class="row">
+          <button id="health" class="secondary">检查服务</button>
+          <button id="save" class="neutral">保存配置</button>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-title">运行参数</div>
+        <label>目标关键词（优先于 Excel）</label>
+        <input id="keyword" placeholder="多个可用逗号、顿号或 or 分隔">
+        <label class="inline"><input id="aiJudgeEnabled" type="checkbox">启用内部 AI 判定</label>
+        <label>AI 接口地址</label>
+        <input id="aiJudgeApiUrl" placeholder="https://api.example.com/v1/chat/completions">
+        <label>AI 模型</label>
+        <input id="aiJudgeModel" placeholder="例如：gpt-4o-mini / deepseek-chat">
+        <label>API Key</label>
+        <input id="aiJudgeApiKey" type="password" placeholder="只保存在本机 Chrome 配置和本地服务">
+      </section>
+
+      <section>
+        <div class="section-title">平台列表 <span class="hint">只运行这里配置的平台</span></div>
+        <div class="platform-head"><span>名称</span><span>URL</span><span></span></div>
+        <div id="platforms"></div>
+        <div class="row">
+          <button id="addPlatform" class="secondary">增加平台</button>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-title">操作</div>
+        <div class="row">
+          <button id="start">开始 / 继续</button>
+          <button id="openLoginTabs" class="secondary">打开登录</button>
+          <button id="stop" class="danger">停止</button>
+        </div>
+        <div class="row wrap">
+          <button id="testFollowup" class="neutral">测试 AI 追问</button>
+          <button id="reloadPage" class="neutral">刷新当前页</button>
+          <button id="reloadExtension" class="neutral">重载插件</button>
+        </div>
+        <div class="row">
+          <button id="resetFailed" class="secondary">重置失败任务</button>
+          <button id="resetAll" class="danger">重置所有任务</button>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-title">状态</div>
+        <pre id="log">等待操作</pre>
+      </section>
     </div>
-    <div class="row">
-      <button id="start">开始</button>
-      <button id="openLoginTabs" class="secondary">打开平台登录</button>
-      <button id="stop" class="danger">停止</button>
-    </div>
-    <div class="row">
-      <button id="health" class="secondary">检查服务</button>
-      <button id="testShot" class="secondary">测试截图</button>
-    </div>
-    <div class="row">
-      <button id="testFollowup" class="secondary">测试AI追问</button>
-      <button id="realUrls" class="secondary">使用真实AI平台</button>
-    </div>
-    <div class="row">
-      <button id="mockUrls" class="secondary">使用本地模拟平台</button>
-    </div>
-    <div class="row">
-      <button id="reloadPage" class="secondary">刷新当前页</button>
-      <button id="reloadExtension" class="secondary">重载插件</button>
-    </div>
-    <div class="row">
-      <button id="resetFailed" class="secondary">重置失败任务</button>
-      <button id="resetAll" class="danger">重置所有任务</button>
-    </div>
-    <label>状态</label>
-    <pre id="log">等待操作</pre>
     <script src="popup.js"></script>
   </body>
 </html>

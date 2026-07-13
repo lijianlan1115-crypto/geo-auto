@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -64,8 +65,19 @@ def ensure_dirs():
         (SCREENSHOT_DIR / platform).mkdir(parents=True, exist_ok=True)
 
 
+def save_workbook_atomic(workbook, target_path):
+    target = Path(target_path)
+    temp = target.with_name(f".{target.stem}.{os.getpid()}.tmp.xlsx")
+    try:
+        workbook.save(temp)
+        os.replace(temp, target)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
 def connect_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -73,6 +85,8 @@ def connect_db():
 def init_db():
     ensure_dirs()
     with connect_db() as conn:
+        conn.execute("pragma journal_mode=WAL")
+        conn.execute("pragma synchronous=FULL")
         conn.execute(
             """
             create table if not exists tasks (
@@ -123,13 +137,13 @@ def find_platform_column(headers, platform):
 
 def split_keywords(value):
     if value is None:
-        return list(KEYWORDS)
+        return []
     text = str(value).strip()
     if not text:
-        return list(KEYWORDS)
+        return []
     parts = re.split(r"[\n,，、;；|/]+|\s+or\s+|\s+OR\s+", text)
     keywords = [part.strip() for part in parts if part and part.strip()]
-    return keywords or list(KEYWORDS)
+    return keywords
 
 
 def safe_platform_key(value, index=0):
@@ -263,7 +277,7 @@ def prepare_workbook(clear_outputs=False):
             ws.cell(row=1, column=max_col, value=followup_name)
             headers[followup_name] = max_col
 
-    wb.save(RESULT_EXCEL)
+    save_workbook_atomic(wb, RESULT_EXCEL)
     return question_col, id_col, keyword_col
 
 
@@ -338,10 +352,10 @@ def get_next_task():
         )
 
     platform = PLATFORMS[task["platform"]]
-    keywords = list(KEYWORDS)
+    keywords = []
     try:
         meta = json.loads(task["answer_text"] or "{}")
-        keywords = meta.get("keywords") or keywords
+        keywords = meta.get("keywords") or []
     except Exception:
         pass
     return {
@@ -349,7 +363,7 @@ def get_next_task():
         "row_number": task["row_number"],
         "row_id": task["row_id"],
         "question": task["question"],
-        "keyword": keywords[0],
+        "keyword": keywords[0] if keywords else "",
         "keywords": keywords,
         "platform": task["platform"],
         "platform_name": platform["name"],
@@ -447,8 +461,8 @@ def get_test_keywords():
     if not INPUT_EXCEL.exists():
         return {
             "ok": True,
-            "source": "default",
-            "keywords": list(KEYWORDS),
+            "source": "missing",
+            "keywords": [],
             "message": f"找不到输入 Excel：{INPUT_EXCEL}",
         }
 
@@ -461,8 +475,8 @@ def get_test_keywords():
     if keyword_col is None:
         return {
             "ok": True,
-            "source": "default",
-            "keywords": list(KEYWORDS),
+            "source": "plugin",
+            "keywords": [],
             "message": f"Excel 没有关键词列，支持列名：{KEYWORD_HEADERS}",
         }
 
@@ -480,9 +494,9 @@ def get_test_keywords():
 
     return {
         "ok": True,
-        "source": "default",
-        "keywords": list(KEYWORDS),
-        "message": "Excel 关键词列为空，使用默认关键词",
+        "source": "plugin",
+        "keywords": [],
+        "message": "Excel 关键词列为空，请使用插件面板中填写的目标关键词",
     }
 
 
@@ -630,20 +644,13 @@ def write_result_to_excel(result, screenshot_path):
 
     matched = bool(result.get("matched"))
     matched_keywords = result.get("matched_keywords") or []
-    if matched and matched_keywords:
+    error_text = str(result.get("error") or "").strip()
+    if error_text:
+        status_text = f"失败：{compact_text(error_text, 60)}"
+    elif matched and matched_keywords:
         status_text = f"命中：{'，'.join(matched_keywords)}"
     else:
         status_text = "命中" if matched else "未命中"
-
-    # 先清空旧状态，确保覆盖
-    ws.cell(row=row_number, column=status_col, value=None)
-    ws.cell(row=row_number, column=followup_col, value=None)
-    wb.save(RESULT_EXCEL)
-
-    # 重新加载以刷新缓存
-    wb = load_workbook(RESULT_EXCEL)
-    ws = wb.active
-    headers = read_headers(ws)
 
     ws.cell(row=row_number, column=status_col, value=status_text)
     ws.cell(row=row_number, column=followup_col, value=int(result.get("followup_count", 0)))
@@ -669,7 +676,7 @@ def write_result_to_excel(result, screenshot_path):
         anchor_image_inside_cell(img, row_number, image_col)
         ws.add_image(img)
 
-    wb.save(RESULT_EXCEL)
+    save_workbook_atomic(wb, RESULT_EXCEL)
 
 
 def submit_result(payload):
@@ -716,6 +723,7 @@ def submit_result(payload):
 
     payload["matched"] = matched
     payload["matched_keywords"] = matched_keywords
+    task_status = "failed" if payload.get("error") else "done"
 
     with lock:
         if screenshot_path:
@@ -730,7 +738,7 @@ def submit_result(payload):
             conn.execute(
                 """
                 update tasks
-                set status = 'done',
+                set status = ?,
                     matched = ?,
                     followup_count = ?,
                     screenshot_path = ?,
@@ -742,6 +750,7 @@ def submit_result(payload):
                 where task_id = ?
                 """,
                 (
+                    task_status,
                     1 if matched else 0,
                     int(payload.get("followup_count", 0)),
                     str(screenshot_path) if screenshot_path else None,
@@ -1097,21 +1106,100 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[{now()}] {self.address_string()} {fmt % args}")
 
 
-def main():
-    init_db()
-    created = seed_tasks()
+def create_service_server():
+    server = ReusableThreadingHTTPServer((HOST, PORT), Handler)
+    try:
+        init_db()
+        created = seed_tasks()
+    except Exception:
+        server.server_close()
+        raise
     print(f"已准备任务，新增 {created} 条")
     print(f"输入 Excel：{INPUT_EXCEL}")
     print(f"结果 Excel：{RESULT_EXCEL}")
     print(f"截图目录：{SCREENSHOT_DIR}")
     print(f"服务地址：http://{HOST}:{PORT}")
+    return server
+
+
+def input_matches_existing_progress(input_path):
+    if not DB_PATH.exists() or not RESULT_EXCEL.exists():
+        return False
+
+    workbook = load_workbook(input_path, read_only=True, data_only=True)
+    try:
+        worksheet = workbook.active
+        headers = read_headers(worksheet)
+        question_col = find_column(headers, QUESTION_HEADERS)
+        if question_col is None:
+            return False
+        with connect_db() as conn:
+            saved_rows = conn.execute(
+                "select row_number, question from tasks group by row_number, question order by row_number"
+            ).fetchall()
+        if not saved_rows:
+            return False
+        for saved in saved_rows:
+            current = worksheet.cell(row=int(saved["row_number"]), column=question_col).value
+            if str(current or "").strip() != str(saved["question"] or "").strip():
+                return False
+        return True
+    finally:
+        workbook.close()
+
+
+def configure_input_excel(input_path):
+    global INPUT_EXCEL
+
+    new_path = Path(input_path).expanduser().resolve()
+    if not new_path.exists():
+        raise FileNotFoundError(f"找不到输入 Excel：{new_path}")
+
+    init_db()
+    if input_matches_existing_progress(new_path):
+        INPUT_EXCEL = new_path
+        return {
+            "ok": True,
+            "input_excel": str(INPUT_EXCEL),
+            "archived_result": "",
+            "resumed_existing_progress": True,
+            "stats": stats(),
+        }
+
+    archive_path = None
+    if RESULT_EXCEL.exists():
+        archive_dir = OUTPUT_DIR / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        archive_path = archive_dir / f"result_{stamp}.xlsx"
+        suffix = 1
+        while archive_path.exists():
+            archive_path = archive_dir / f"result_{stamp}_{suffix}.xlsx"
+            suffix += 1
+        shutil.move(str(RESULT_EXCEL), str(archive_path))
+
+    INPUT_EXCEL = new_path
+    with lock, connect_db() as conn:
+        conn.execute("delete from tasks")
+
+    return {
+        "ok": True,
+        "input_excel": str(INPUT_EXCEL),
+        "archived_result": str(archive_path) if archive_path else "",
+        "resumed_existing_progress": False,
+    }
+
+
+def main():
+    server = create_service_server()
     print("先启动本服务，再在 Chrome 加载插件并点击开始。")
 
-    server = ReusableThreadingHTTPServer((HOST, PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n服务已停止")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

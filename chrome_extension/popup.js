@@ -23,9 +23,37 @@ const aiJudgeModelInput = document.getElementById("aiJudgeModel");
 const aiJudgeApiKeyInput = document.getElementById("aiJudgeApiKey");
 const platformsEl = document.getElementById("platforms");
 const logEl = document.getElementById("log");
+const serviceBadgeEl = document.getElementById("serviceBadge");
+
+function formatStatus(message) {
+  if (typeof message === "string") return message;
+  if (!message || typeof message !== "object") return String(message || "等待操作");
+  if (message.title) {
+    return [message.title, message.prompt, message.reason].filter(Boolean).join("\n");
+  }
+  if (message.ok === false) return `操作失败：${message.error || message.message || "请重试"}`;
+  if (message.message) return message.message;
+  if (message.saved_to_chrome) return "配置已保存";
+  if (message.stats) {
+    const pending = Number(message.stats.pending || 0);
+    const done = Number(message.stats.done || 0);
+    return `服务已连接 · 待执行 ${pending} · 已完成 ${done}`;
+  }
+  if (message.ok) return "操作成功";
+  return JSON.stringify(message, null, 2);
+}
 
 function log(message) {
-  logEl.textContent = typeof message === "string" ? message : JSON.stringify(message, null, 2);
+  logEl.textContent = formatStatus(message);
+}
+
+function setServiceBadge(state, text) {
+  serviceBadgeEl.className = `badge ${state || ""}`.trim();
+  serviceBadgeEl.textContent = text;
+}
+
+function isOk(result) {
+  return Boolean(result && result.ok);
 }
 
 async function send(action, payload = {}) {
@@ -143,11 +171,15 @@ async function saveSettings() {
 
 document.getElementById("health").addEventListener("click", async () => {
   const form = readForm();
-  log(await send("HEALTH", { serverUrl: form.serverUrl }));
+  setServiceBadge("", "检查中...");
+  const result = await send("HEALTH", { serverUrl: form.serverUrl });
+  setServiceBadge(isOk(result) ? "ok" : "warn", isOk(result) ? "服务已连接" : "服务异常");
+  log(result);
 });
 
 document.getElementById("save").addEventListener("click", async () => {
-  log(await saveSettings());
+  const result = await saveSettings();
+  log(result);
 });
 
 document.getElementById("testFollowup").addEventListener("click", async () => {
@@ -195,27 +227,6 @@ document.getElementById("testFollowup").addEventListener("click", async () => {
     conversation_turns: result && result.conversation_turns,
     raw: result,
   });
-});
-
-document.getElementById("testShot").addEventListener("click", async () => {
-  const form = readForm();
-  const saved = await saveSettings();
-  if (!saved || !saved.ok) {
-    log(saved || { ok: false, error: "保存配置失败" });
-    return;
-  }
-  log(await send("TEST_SCREENSHOT", { serverUrl: form.serverUrl, keyword: form.keyword }));
-});
-
-document.getElementById("mockUrls").addEventListener("click", async () => {
-  const serverUrl = serverUrlInput.value.replace(/\/$/, "");
-  renderPlatforms(defaultPlatforms(`${serverUrl}/mock-platform`));
-  log(await saveSettings());
-});
-
-document.getElementById("realUrls").addEventListener("click", async () => {
-  renderPlatforms(defaultPlatforms());
-  log(await saveSettings());
 });
 
 document.getElementById("addPlatform").addEventListener("click", () => {
@@ -291,6 +302,7 @@ send("GET_SETTINGS").then((data) => {
     renderPlatforms(defaultPlatforms());
   }
   normalizePlatformRows();
+  setServiceBadge("", "服务未检查");
 }).catch(() => {
   chrome.storage.local.get(["serverUrl", "concurrency", "keyword", "platforms", "platformUrls", "aiJudge"], (data) => {
     if (data.serverUrl) serverUrlInput.value = data.serverUrl;
@@ -309,5 +321,6 @@ send("GET_SETTINGS").then((data) => {
       renderPlatforms(defaultPlatforms());
     }
     normalizePlatformRows();
+    setServiceBadge("", "服务未检查");
   });
 });

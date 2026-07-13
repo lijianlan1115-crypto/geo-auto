@@ -21,6 +21,9 @@ RUNTIME_CONFIG = {
     "timeout_seconds": AI_JUDGE_TIMEOUT_SECONDS,
 }
 
+QUICK_JUDGE_TIMEOUT_SECONDS = 4
+QUICK_FOLLOWUP_TIMEOUT_SECONDS = 6
+
 
 def load_persisted_ai_config():
     try:
@@ -147,14 +150,15 @@ def get_ai_judge_config():
     }
 
 
-def call_chat_completions(payload):
+def call_chat_completions(payload, timeout_seconds=None):
     request = urllib.request.Request(
         chat_completions_url(),
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {RUNTIME_CONFIG.get('api_key')}"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=RUNTIME_CONFIG.get("timeout_seconds") or AI_JUDGE_TIMEOUT_SECONDS) as response:
+    timeout = timeout_seconds or RUNTIME_CONFIG.get("timeout_seconds") or AI_JUDGE_TIMEOUT_SECONDS
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -174,7 +178,9 @@ def ai_judge(answer_text, keywords, question="", platform=""):
         "response_format": {"type": "json_object"},
     }
     try:
-        body = call_chat_completions(payload)
+        runtime_timeout = int(RUNTIME_CONFIG.get("timeout_seconds") or AI_JUDGE_TIMEOUT_SECONDS)
+        judge_timeout = max(3, min(QUICK_JUDGE_TIMEOUT_SECONDS, runtime_timeout))
+        body = call_chat_completions(payload, timeout_seconds=judge_timeout)
         judged = json.loads(body["choices"][0]["message"]["content"])
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
         local["ai_error"] = str(exc)
@@ -229,6 +235,7 @@ def infer_target_profile(keywords, question=""):
 
     category = "对象/机构/品牌"
     category_clues = []
+    scenario_clues = []
     if re.search(r"大学|学院|学校|院校|本科|专科|职业技术", raw_text):
         category = "院校/教育机构"
         category_clues = ["同地区", "同层次", "同类型专业", "录取难度", "就业方向"]
@@ -244,16 +251,30 @@ def infer_target_profile(keywords, question=""):
     elif re.search(r"景区|公园|古镇|博物馆|旅游|度假", raw_text):
         category = "文旅/景区"
         category_clues = ["同城市", "游玩场景", "交通便利", "口碑", "适合人群"]
+    elif re.search(r"餐厅|饭店|餐饮|辣子鸡|火锅|酸汤|小吃|食品|特产|门店|酒楼|餐馆", raw_text):
+        category = "餐饮门店/食品品牌"
+        category_clues = ["同城市", "同品类", "本地老字号", "门店口碑", "购买或包装方式"]
     elif re.search(r"产品|系统|平台|软件|APP|工具", raw_text + q_text):
         category = "产品/软件/平台"
         category_clues = ["功能匹配", "使用场景", "价格", "交付服务", "替代方案"]
+
+    if re.search(r"长辈|老人|父母|爷爷|奶奶", q_text) and re.search(r"故事|经历|一生|人生", q_text):
+        scenario_clues.extend(["长辈口述经历整理", "人生故事影像化", "回忆录或传记制作", "家庭纪念"])
+    if re.search(r"人生剧|人生电影|影像|视频", q_text):
+        scenario_clues.extend(["人生影像制作", "口述史采访", "脚本策划", "成片交付"])
+    if re.search(r"回忆录|传记|家谱", q_text):
+        scenario_clues.extend(["资料采集", "采访整理", "内容创作", "图文或影像交付"])
+    if re.search(r"真空包装|邮寄|伴手礼|特产", q_text):
+        scenario_clues.extend(["真空包装", "可邮寄", "本地门店", "伴手礼购买"])
+    scenario_clues = list(dict.fromkeys(scenario_clues))
 
     return {
         "target_keywords_internal": keywords,
         "category": category,
         "regions": regions,
         "category_clues": category_clues,
-        "guidance": "追问要把被测AI拉回原问题，并逐步增加与目标对象相同的地区、类型、层次、场景或服务能力约束，让它更可能自然列出目标对象。",
+        "scenario_clues": scenario_clues,
+        "guidance": "目标画像和原始问题意图优先于上一轮回答。追问应主动增加与目标对象相同的地区、类型、场景和服务能力约束，让被测AI更可能自然列出目标对象。",
     }
 
 
@@ -328,32 +349,48 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
     if len(normalize_text(real_answer)) < 20:
         return {"ok": False, "prompt": "", "source": "error", "reason": "没有获取到足够长度的平台真实回复，停止追问", "real_answer_valid": False, "conversation_turns": len(conversation)}
     if not followup_config_ready():
-        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问接口配置不完整，已停止追问，避免使用固定模板", "real_answer_valid": True, "conversation_turns": len(conversation)}
+        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问接口配置不完整", "real_answer_valid": True, "conversation_turns": len(conversation)}
 
+    original_question = next(
+        (item["content"] for item in conversation if item.get("role") == "user" and item.get("content")),
+        previous_question,
+    )
     forbidden_terms = sorted({alias for keyword in keywords for alias in keyword_aliases(keyword)}, key=len, reverse=True)
     safe_conversation = []
-    for item in conversation[-8:]:
-        safe_conversation.append({"role": item["role"], "content": redact_forbidden_terms(compact_for_prompt(item["content"], 1800), keywords)})
+    normalized_real_answer = normalize_text(real_answer)
+    for item in conversation[-6:]:
+        if item["role"] == "assistant" and normalize_text(item["content"]) == normalized_real_answer:
+            continue
+        safe_conversation.append({"role": item["role"], "content": redact_forbidden_terms(compact_for_prompt(item["content"], 900), keywords)})
 
-    target_profile = infer_target_profile(keywords, previous_question)
+    target_profile = infer_target_profile(keywords, original_question)
     structured_input = {
-        "question": redact_forbidden_terms(compact_for_prompt(previous_question, 900), keywords),
-        "answer": redact_forbidden_terms(compact_for_prompt(real_answer, 2400), keywords),
+        "original_question": redact_forbidden_terms(compact_for_prompt(original_question, 900), keywords),
+        "latest_question": redact_forbidden_terms(compact_for_prompt(previous_question, 900), keywords),
+        "latest_answer": redact_forbidden_terms(compact_for_prompt(real_answer, 1800), keywords),
         "platform": real_platform,
         "conversation": safe_conversation,
         "followup_count": followup_count,
         "forbidden_terms": forbidden_terms,
         "target_profile_internal": target_profile,
+        "priority_order": [
+            "1. target_profile_internal：最高优先级，用于决定追问要靠近的地区、类别、场景和能力",
+            "2. original_question：第二优先级，必须保持用户最初目的和使用场景",
+            "3. latest_answer：第三优先级，只用于识别已提及内容和遗漏，不能把追问方向带离目标画像",
+        ],
         "strategy": followup_strategy(followup_count),
-        "task": "生成一句目标导向追问：目标是让被测AI在下一轮回答中更可能自然提到 target_profile_internal.target_keywords_internal 里的对象，但追问文本本身绝不能出现这些词。",
+        "task": "在内部生成3个不同的追问候选，比较哪个最可能让被测AI自然列出 target_profile_internal.target_keywords_internal 中的对象，然后只输出得分最高的一句。最终追问绝不能出现目标对象名称、简称、别名或明显变体。",
         "rules": [
-            "必须围绕原始问题继续问，不能换话题，不能越问越宽泛。",
-            "必须根据最后一条assistant真实回答中的缺口追问，同时叠加目标画像里的地区、类别、层次、场景或服务能力约束。",
+            "严格遵守 priority_order；即使 latest_answer 内容很丰富或已经偏题，也要优先服从目标画像和原始问题。",
+            "必须围绕 original_question 继续问，不能换话题，不能越问越宽泛。",
+            "必须同时使用目标画像中的地区、类别、scenario_clues 和服务能力约束，形成高信息量、强指向但自然的用户问题。",
+            "latest_answer 只用于避免重复已有候选、发现遗漏和选择下一步收窄角度，不能成为追问的最高优先级。",
             "追问要像普通用户自然追问，不能暴露测试、命中、目标词、关键词、GEO检测等意图。",
             "不要出现任何forbidden_terms中的词或其明显变体。",
             "不能直接给出目标关键词、目标对象名称、简称或别名。",
-            "优先问：是否遗漏了同地区/同类型/同定位/同场景的具体名称，而不是泛泛问更多信息。",
+            "优先要求补充同地区、同类型、同场景且具备具体交付能力的名称，而不是泛泛问更多信息。",
             "如果上一轮回答已经列了很多对象，就要求只补充新增且最贴近原条件的候选。",
+            "每轮追问都要比上一轮增加至少一个有效约束，例如地区、服务对象、交付形式、案例能力或购买条件。",
             "不能输出代码、SQL、JSON、HTML、操作步骤、列表或多条问题。",
             "只能问一个方向，40到120个中文字符。",
         ],
@@ -362,45 +399,52 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
             "能不能再详细介绍一下？",
             "请继续补充更多选择。",
         ],
-        "good_pattern": "除了刚才这些，是否还遗漏了【同地区/同类型/同场景】且【更贴近原问题条件】的具体名称？请只补充新增候选。",
+        "good_pattern": "如果要在【目标地区】寻找能为【原始服务对象】提供【目标场景与交付形式】的专业团队，还应重点比较哪些有真实案例和完整交付能力的服务商？请只补充前面未出现的名称。",
         "return_schema": {"prompt": "下一轮追问文本", "intent": "为什么这样追问，20字以内"},
     }
 
     payload = {
         "model": RUNTIME_CONFIG.get("model"),
         "messages": [
-            {"role": "system", "content": "你是GEO反馈检测追问生成器。你会收到结构化输入：question、answer、conversation、target_profile_internal。你要用内部目标画像设计追问，让被测AI更可能自然提到目标对象；但你输出的追问绝不能出现目标对象名称、简称或别名。只返回严格JSON。"},
+            {"role": "system", "content": "你是高命中率GEO追问生成器。优先级固定为：隐藏目标画像 > 原始问题意图 > 最新回答。最新回答只能帮助识别遗漏，不能改变目标方向。你必须在内部比较3个候选问题，选择最可能自然引出目标对象的一句；最终文本绝不能出现目标名称、简称、别名或明显变体。只返回严格JSON。"},
             {"role": "user", "content": json.dumps(structured_input, ensure_ascii=False)},
         ],
         "temperature": 0.28,
         "response_format": {"type": "json_object"},
     }
 
-    try:
+    runtime_timeout = int(RUNTIME_CONFIG.get("timeout_seconds") or AI_JUDGE_TIMEOUT_SECONDS)
+    followup_timeout = max(4, min(QUICK_FOLLOWUP_TIMEOUT_SECONDS, runtime_timeout))
+    attempt_errors = []
+
+    for attempt in range(2):
+        attempt_payload = dict(payload)
+        attempt_payload["messages"] = [dict(item) for item in payload["messages"]]
+        api_mode = "json_object" if attempt == 0 else "plain_retry"
+        if attempt > 0:
+            attempt_payload.pop("response_format", None)
+            attempt_payload["messages"][0]["content"] += "这是独立重试。只返回一句合规追问，不要解释，不要包含目标名称。"
         try:
-            body = call_chat_completions(payload)
-            api_mode = "json_object"
-        except urllib.error.HTTPError as exc:
-            if exc.code != 400:
-                raise
-            relaxed_payload = dict(payload)
-            relaxed_payload.pop("response_format", None)
-            relaxed_payload["messages"] = list(relaxed_payload["messages"])
-            relaxed_payload["messages"][0] = dict(relaxed_payload["messages"][0])
-            relaxed_payload["messages"][0]["content"] += "如果接口不支持JSON模式，也可以只返回一句追问文本，不要返回其他说明。"
-            body = call_chat_completions(relaxed_payload)
-            api_mode = "plain_retry"
-        content = body["choices"][0]["message"]["content"]
-        prompt, intent = parse_followup_content(content)
-    except Exception as exc:
-        return {"ok": False, "prompt": "", "source": "error", "reason": f"AI追问生成失败：{exc}", "real_answer_valid": True, "conversation_turns": len(conversation)}
+            body = call_chat_completions(attempt_payload, timeout_seconds=followup_timeout)
+            content = body["choices"][0]["message"]["content"]
+            prompt, intent = parse_followup_content(content)
+            prompt = str(prompt or "").strip()
+            if not prompt:
+                raise ValueError("AI追问为空")
+            if contains_forbidden_keyword(prompt, keywords):
+                raise ValueError("AI追问包含目标关键词或别名")
+            if len(prompt) > 160 or "\n" in prompt:
+                raise ValueError("AI追问格式不合规")
+            return {"ok": True, "prompt": prompt, "source": "ai", "intent": intent, "api_mode": api_mode, "retry_count": attempt, "real_answer_valid": True, "conversation_turns": len(conversation), "used_structured_context": True, "target_directed": True, "target_profile": {"category": target_profile.get("category"), "regions": target_profile.get("regions"), "category_clues": target_profile.get("category_clues")}}
+        except Exception as exc:
+            attempt_errors.append(str(exc))
 
-    prompt = str(prompt or "").strip()
-    if not prompt:
-        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问为空", "real_answer_valid": True, "conversation_turns": len(conversation)}
-    if contains_forbidden_keyword(prompt, keywords):
-        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问包含目标关键词或别名，已停止追问", "real_answer_valid": True, "conversation_turns": len(conversation), "target_profile": target_profile}
-    if len(prompt) > 160 or "\n" in prompt:
-        return {"ok": False, "prompt": "", "source": "error", "reason": "AI追问格式不合规，已停止追问", "real_answer_valid": True, "conversation_turns": len(conversation), "target_profile": target_profile}
-
-    return {"ok": True, "prompt": prompt, "source": "ai", "intent": intent, "api_mode": api_mode, "real_answer_valid": True, "conversation_turns": len(conversation), "used_structured_context": True, "target_directed": True, "target_profile": {"category": target_profile.get("category"), "regions": target_profile.get("regions"), "category_clues": target_profile.get("category_clues")}}
+    return {
+        "ok": False,
+        "prompt": "",
+        "source": "error",
+        "reason": f"AI追问生成失败，已独立重试1次：{'；'.join(attempt_errors)}",
+        "real_answer_valid": True,
+        "conversation_turns": len(conversation),
+        "used_structured_context": True,
+    }

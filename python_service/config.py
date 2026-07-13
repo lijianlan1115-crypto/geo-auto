@@ -1,11 +1,16 @@
 from pathlib import Path
 import os
+import sys
 
 
-BASE_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent.parent
 
-INPUT_EXCEL = PROJECT_DIR / "input.xlsx"
+configured_input_excel = os.getenv("GEO_INPUT_EXCEL", "").strip()
+INPUT_EXCEL = Path(configured_input_excel).expanduser().resolve() if configured_input_excel else PROJECT_DIR / "input.xlsx"
 OUTPUT_DIR = PROJECT_DIR / "output"
 SCREENSHOT_DIR = OUTPUT_DIR / "screenshots"
 RESULT_EXCEL = OUTPUT_DIR / "result.xlsx"
@@ -16,8 +21,10 @@ AI_JUDGE_CONFIG_PATH = OUTPUT_DIR / "ai_judge_config.json"
 HOST = "127.0.0.1"
 PORT = 8765
 
-KEYWORDS = ["贵州商学院", "贵阳商学院"]
-KEYWORD = "贵阳商学院"
+# Target keywords come from each Excel row or the Chrome extension settings.
+# Keep the service fallback empty so a missing configuration cannot run silently.
+KEYWORDS = []
+KEYWORD = ""
 MAX_FOLLOWUPS = 3
 CONCURRENCY = 3
 

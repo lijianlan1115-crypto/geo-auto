@@ -1,0 +1,47 @@
+name: Build Windows package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: python_service
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-build.txt
+
+      - name: Build desktop application
+        working-directory: python_service
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --hidden-import sqlite3 --hidden-import _sqlite3 --name "GEO反馈自动化" --distpath . --workpath build --specpath build desktop_app.py
+
+      - name: Create delivery ZIP
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release/GEO反馈自动化_Windows | Out-Null
+          Copy-Item "python_service/GEO反馈自动化.exe" "release/GEO反馈自动化_Windows/"
+          Copy-Item chrome_extension "release/GEO反馈自动化_Windows/chrome_extension" -Recurse
+          Copy-Item 使用说明.md "release/GEO反馈自动化_Windows/"
+          Compress-Archive -Path "release/GEO反馈自动化_Windows" -DestinationPath "release/GEO反馈自动化_Windows.zip" -Force
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: GEO反馈自动化_Windows
+          path: release/GEO反馈自动化_Windows.zip
+          if-no-files-found: error
