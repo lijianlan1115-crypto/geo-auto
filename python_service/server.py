@@ -70,21 +70,24 @@ def save_workbook_atomic(workbook, target_path):
     target = Path(target_path)
     temp = target.with_name(f".{target.stem}.{os.getpid()}.tmp.xlsx")
     try:
-        for attempt in range(3):
+        workbook.save(temp)
+    finally:
+        workbook.close()
+
+    try:
+        for attempt in range(5):
             try:
-                workbook.save(temp)
                 os.replace(temp, target)
-                break
+                return
             except PermissionError as exc:
-                if attempt == 2:
+                if attempt == 4:
                     raise PermissionError(
                         f"无法写入结果文件：{target}。请关闭 Excel/WPS、资源管理器预览窗格或同步工具后重试。"
                     ) from exc
-                time.sleep(0.5)
+                time.sleep(0.6)
     finally:
         if temp.exists():
             temp.unlink()
-        workbook.close()
 
 
 def connect_db():
