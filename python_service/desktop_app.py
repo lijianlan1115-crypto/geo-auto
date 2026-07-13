@@ -319,7 +319,7 @@ class DesktopApp:
 
         tk.Label(
             body,
-            text="结果会自动另存为新文件；关闭窗口将同时停止本地服务。",
+            text="结果会自动另存为新文件；截图会在回答稳定后生成。关闭窗口将同时停止本地服务。",
             bg="#f4f6f8",
             fg="#667085",
             font=("Microsoft YaHei UI", 9),

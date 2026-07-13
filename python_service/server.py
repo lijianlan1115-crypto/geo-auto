@@ -15,6 +15,8 @@ import config as service_config
 from config import (
     ANSWER_POLL_INTERVAL,
     ANSWER_KEYWORD_STABLE_SECONDS,
+    ANSWER_FINAL_SETTLE_SECONDS,
+    ANSWER_MIN_CHARS,
     ANSWER_STABLE_SECONDS,
     ANSWER_TIMEOUT_SECONDS,
     CONCURRENCY,
@@ -273,6 +275,7 @@ def prepare_workbook(clear_outputs=False):
     if not INPUT_EXCEL.exists():
         raise FileNotFoundError(f"找不到输入 Excel：{INPUT_EXCEL}")
 
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     if not RESULT_EXCEL.exists():
         shutil.copy2(INPUT_EXCEL, RESULT_EXCEL)
 
@@ -296,6 +299,7 @@ def prepare_workbook(clear_outputs=False):
     id_col = find_column(headers, ID_HEADERS)
     keyword_col = find_column(headers, KEYWORD_HEADERS)
 
+    # 第一段：所有平台结果图连续排列，方便横向比较。
     max_col = ws.max_column
     for platform, item in PLATFORMS.items():
         column_name = item["column"]
@@ -307,6 +311,9 @@ def prepare_workbook(clear_outputs=False):
         elif column_name not in headers:
             headers[column_name] = existing_col
 
+    # 第二段：结果图之后再统一放置状态和追问次数。
+    for platform, item in PLATFORMS.items():
+        column_name = item["column"]
         status_name = f"{column_name}_状态"
         if status_name not in headers:
             max_col += 1
@@ -422,6 +429,8 @@ def get_next_task():
         "answer_poll_interval": ANSWER_POLL_INTERVAL,
         "answer_stable_seconds": ANSWER_STABLE_SECONDS,
         "answer_keyword_stable_seconds": ANSWER_KEYWORD_STABLE_SECONDS,
+        "answer_final_settle_seconds": ANSWER_FINAL_SETTLE_SECONDS,
+        "answer_min_chars": ANSWER_MIN_CHARS,
         "answer_timeout_seconds": ANSWER_TIMEOUT_SECONDS,
     }
 

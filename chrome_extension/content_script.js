@@ -1034,6 +1034,7 @@ async function waitAnswerStable(task, previousText = "") {
   const pollMs = Math.max(300, Number(task.answer_poll_interval || 0.8) * 1000);
   const stableMs = Number(task.answer_stable_seconds || 3) * 1000;
   const keywordStableMs = Number(task.answer_keyword_stable_seconds || 1.5) * 1000;
+  const minAnswerChars = Math.max(20, Number(task.answer_min_chars || 40));
   const timeoutMs = Number(task.answer_timeout_seconds || 90) * 1000;
   const started = Date.now();
   const previousNormalized = normalizeKeywordText(previousText || "");
@@ -1056,11 +1057,20 @@ async function waitAnswerStable(task, previousText = "") {
       keywordSeen = containsAnyTargetKeyword(text, keywords);
       if (normalized && normalized !== previousNormalized && !transient) sawNewAnswer = true;
     }
-    const requiredStableMs = keywordSeen ? keywordStableMs : stableMs;
-    if (sawNewAnswer && lastNormalized && !transient && !generating && Date.now() - lastChangedAt >= requiredStableMs) {
-      GEO_LAST_ANSWER_ELEMENT = findLatestAnswerElement(task.platform, previousText, lastText);
-      GEO_LAST_ANSWER_DEBUG = collectAnswerDebug(task.platform, previousText, GEO_LAST_ANSWER_ELEMENT, keywordSeen ? "keyword_fast_stable" : "stable");
-      return latestAnswerElementText(lastText);
+    const requiredStableMs = Math.max(stableMs, keywordSeen ? keywordStableMs : 0);
+    const candidate = findLatestAnswerElement(task.platform, previousText, lastText);
+    const candidateText = textFromNode(candidate);
+    const candidateLength = normalizeKeywordText(candidateText).length;
+    if (
+      sawNewAnswer &&
+      candidateLength >= minAnswerChars &&
+      !transient &&
+      !generating &&
+      Date.now() - lastChangedAt >= requiredStableMs
+    ) {
+      GEO_LAST_ANSWER_ELEMENT = candidate;
+      GEO_LAST_ANSWER_DEBUG = collectAnswerDebug(task.platform, previousText, GEO_LAST_ANSWER_ELEMENT, "stable_complete_answer");
+      return latestAnswerElementText(candidateText || lastText);
     }
     await sleep(pollMs);
   }
@@ -1071,6 +1081,44 @@ async function waitAnswerStable(task, previousText = "") {
   GEO_LAST_ANSWER_ELEMENT = findLatestAnswerElement(task.platform, previousText, lastText);
   GEO_LAST_ANSWER_DEBUG = collectAnswerDebug(task.platform, previousText, GEO_LAST_ANSWER_ELEMENT, "timeout_return_last");
   return latestAnswerElementText(lastText);
+}
+
+async function waitForFinalAnswerRender(task, fallbackText = "") {
+  const pollMs = Math.max(300, Number(task.answer_poll_interval || 0.8) * 1000);
+  const settleMs = Math.max(3000, Number(task.answer_final_settle_seconds || 8) * 1000);
+  const minAnswerChars = Math.max(20, Number(task.answer_min_chars || 40));
+  const timeoutMs = Math.max(settleMs + 3000, Number(task.answer_timeout_seconds || 90) * 1000);
+  const started = Date.now();
+  let candidate = GEO_LAST_ANSWER_ELEMENT;
+  let lastText = textFromNode(candidate) || fallbackText || "";
+  let lastNormalized = normalizeKeywordText(lastText);
+  let lastChangedAt = Date.now();
+
+  while (Date.now() - started < timeoutMs) {
+    const pageText = getAnswerText(task.platform);
+    candidate = findLatestAnswerElement(task.platform, "", pageText) || candidate;
+    const text = textFromNode(candidate) || pageText || lastText;
+    const normalized = normalizeKeywordText(text);
+    if (normalized !== lastNormalized) {
+      lastText = text;
+      lastNormalized = normalized;
+      lastChangedAt = Date.now();
+    }
+    if (
+      lastNormalized.length >= minAnswerChars &&
+      !pageIsAnswerGenerating(task.platform) &&
+      Date.now() - lastChangedAt >= settleMs
+    ) {
+      GEO_LAST_ANSWER_ELEMENT = candidate;
+      GEO_LAST_ANSWER_DEBUG = collectAnswerDebug(task.platform, "", candidate, "final_screenshot_ready");
+      return latestAnswerElementText(lastText);
+    }
+    await sleep(pollMs);
+  }
+
+  GEO_LAST_ANSWER_ELEMENT = candidate;
+  GEO_LAST_ANSWER_DEBUG = collectAnswerDebug(task.platform, "", candidate, "final_screenshot_timeout");
+  return latestAnswerElementText(lastText || fallbackText);
 }
 
 function clearKeywordMarks() {
@@ -2399,6 +2447,28 @@ async function runPlatformTask(task) {
     matched = Boolean(judgeResult.matched);
     matchedKeywords = matched ? uniqueList([judgeResult.matched_text, judgeResult.keyword, keywords[0]]) : [];
     if (matched) {
+      domLocation = await locateAndMarkKeywordForScreenshot(task.platform, answerText, matchedKeywords, judgeResult, keywords);
+    }
+  }
+
+  // 即使关键词已命中，也要等待最终正文稳定后才截图。
+  // 这避免只截到标题、首段或尚未完成的流式回答。
+  const finalAnswerText = await waitForFinalAnswerRender(task, answerText);
+  if (normalizeKeywordText(finalAnswerText) !== normalizeKeywordText(answerText)) {
+    answerText = finalAnswerText;
+    const finalJudge = await judgeAnswer(answerText, keywords, task);
+    runDebug.push({
+      round: followupCount,
+      type: "final_stable_check",
+      answer_length: String(answerText || "").length,
+      answer_preview: String(answerText || "").replace(/\s+/g, " ").slice(0, 800),
+      judge_result: finalJudge,
+      answer_debug: GEO_LAST_ANSWER_DEBUG,
+    });
+    if (!matched && finalJudge.matched) {
+      judgeResult = finalJudge;
+      matched = true;
+      matchedKeywords = uniqueList([finalJudge.matched_text, finalJudge.keyword, keywords[0]]);
       domLocation = await locateAndMarkKeywordForScreenshot(task.platform, answerText, matchedKeywords, judgeResult, keywords);
     }
   }
