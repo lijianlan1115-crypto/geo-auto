@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "GEO反馈自动化助手",
+  "version": "0.1.0",
+  "description": "控制AI平台提问、追问、截图，并把结果交给Python本地服务写回Excel。",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "activeTab",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:8765/*",
+    "https://www.doubao.com/*",
+    "https://chat.deepseek.com/*",
+    "https://yuanbao.tencent.com/*",
+    "https://yiyan.baidu.com/*",
+    "https://chat.baidu.com/*",
+    "https://tongyi.aliyun.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "GEO反馈自动化"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.doubao.com/*",
+        "https://chat.deepseek.com/*",
+        "https://yuanbao.tencent.com/*",
+        "https://yiyan.baidu.com/*",
+        "https://chat.baidu.com/*",
+        "https://tongyi.aliyun.com/*",
+        "http://127.0.0.1:8765/*"
+      ],
+      "js": ["content_script.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

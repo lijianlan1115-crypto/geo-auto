@@ -22,3 +22,4 @@ output/
 cookie*
 session*
 *.json
+!chrome_extension/manifest.json
