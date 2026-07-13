@@ -67,6 +67,8 @@ def ensure_dirs():
 
 
 def save_workbook_atomic(workbook, target_path):
+    global RESULT_EXCEL
+
     target = Path(target_path)
     temp = target.with_name(f".{target.stem}.{os.getpid()}.tmp.xlsx")
     try:
@@ -81,6 +83,16 @@ def save_workbook_atomic(workbook, target_path):
                 return
             except PermissionError as exc:
                 if attempt == 4:
+                    # 某些 Windows 环境会被资源管理器预览、同步软件或安全软件
+                    # 短暂锁定目标文件。结果表无法覆盖时，自动改写到新文件，
+                    # 使当前任务继续运行而不是整体失败。
+                    if target == RESULT_EXCEL:
+                        fallback = create_result_excel_path(target.parent)
+                        os.replace(temp, fallback)
+                        RESULT_EXCEL = fallback
+                        service_config.RESULT_EXCEL = fallback
+                        print(f"结果表被占用，已自动切换到新文件：{fallback}")
+                        return
                     raise PermissionError(
                         f"无法写入结果文件：{target}。请关闭 Excel/WPS、资源管理器预览窗格或同步工具后重试。"
                     ) from exc
