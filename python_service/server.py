@@ -140,6 +140,22 @@ def init_db():
             conn.execute("alter table tasks add column run_debug text")
 
 
+def recover_interrupted_tasks():
+    """将上次退出时遗留的 running 任务恢复为可继续执行的 pending。"""
+    with connect_db() as conn:
+        cursor = conn.execute(
+            """
+            update tasks
+            set status = 'pending',
+                error = coalesce(error, '程序中断，已自动恢复'),
+                updated_at = ?
+            where status = 'running'
+            """,
+            (now(),),
+        )
+    return cursor.rowcount
+
+
 def read_headers(sheet):
     headers = {}
     for cell in sheet[1]:
@@ -308,15 +324,22 @@ def prepare_workbook(clear_outputs=False):
 
 
 def seed_tasks(clear_outputs=False):
-    try:
-        question_col, id_col, keyword_col = prepare_workbook(clear_outputs=clear_outputs)
-    except Exception as exc:
-        print(f"任务初始化跳过：{exc}")
-        print("服务会继续启动，方便先测试 Chrome 插件连接；换成包含“问题”列的 Excel 后再重启即可生成任务。")
+    """只从输入表创建任务；结果表无法写入时也不影响断点续跑。"""
+    if not INPUT_EXCEL.exists():
+        print(f"任务初始化跳过：找不到输入 Excel：{INPUT_EXCEL}")
         return 0
 
-    wb = load_workbook(RESULT_EXCEL, read_only=True)
+    wb = load_workbook(INPUT_EXCEL, read_only=True, data_only=True)
     ws = wb.active
+
+    headers = read_headers(ws)
+    question_col = find_column(headers, QUESTION_HEADERS)
+    id_col = find_column(headers, ID_HEADERS)
+    keyword_col = find_column(headers, KEYWORD_HEADERS)
+    if question_col is None:
+        wb.close()
+        print(f"任务初始化跳过：Excel 第一行没有问题列，支持：{QUESTION_HEADERS}")
+        return 0
 
     created = 0
     with connect_db() as conn:
@@ -355,6 +378,7 @@ def seed_tasks(clear_outputs=False):
                     ),
                 )
                 created += 1
+    wb.close()
     return created
 
 
@@ -705,6 +729,43 @@ def write_result_to_excel(result, screenshot_path):
     save_workbook_atomic(wb, RESULT_EXCEL)
 
 
+def sync_result_from_db():
+    """将 SQLite 中已完成的状态补写到结果表；导出失败不影响任务状态。"""
+    try:
+        prepare_workbook()
+        with connect_db() as conn:
+            rows = conn.execute(
+                """
+                select row_number, platform, status, matched, followup_count, error
+                from tasks
+                where status in ('done', 'failed')
+                """
+            ).fetchall()
+
+        wb = load_workbook(RESULT_EXCEL)
+        ws = wb.active
+        headers = read_headers(ws)
+        for task in rows:
+            platform = PLATFORMS.get(task["platform"])
+            if not platform:
+                continue
+            status_col = headers.get(f"{platform['column']}_状态")
+            followup_col = headers.get(f"{platform['column']}_追问次数")
+            if not status_col or not followup_col:
+                continue
+            if task["status"] == "failed":
+                status_text = f"失败：{compact_text(task['error'], 60)}"
+            else:
+                status_text = "命中" if task["matched"] else "未命中"
+            ws.cell(row=int(task["row_number"]), column=status_col, value=status_text)
+            ws.cell(row=int(task["row_number"]), column=followup_col, value=int(task["followup_count"] or 0))
+        save_workbook_atomic(wb, RESULT_EXCEL)
+        return True
+    except Exception as exc:
+        print(f"结果表同步暂缓（任务状态已保存在 SQLite）：{exc}")
+        return False
+
+
 def submit_result(payload):
     required = ["task_id", "row_number", "platform"]
     missing = [key for key in required if key not in payload]
@@ -751,45 +812,53 @@ def submit_result(payload):
     payload["matched_keywords"] = matched_keywords
     task_status = "failed" if payload.get("error") else "done"
 
-    with lock:
-        if screenshot_path:
+    with lock, connect_db() as conn:
+        # 先落库。即使 Excel 被占用，任务完成状态也不会丢失。
+        conn.execute(
+            """
+            update tasks
+            set status = ?,
+                matched = ?,
+                followup_count = ?,
+                screenshot_path = ?,
+                answer_text = ?,
+                answer_debug = ?,
+                run_debug = ?,
+                error = ?,
+                updated_at = ?
+            where task_id = ?
+            """,
+            (
+                task_status,
+                1 if matched else 0,
+                int(payload.get("followup_count", 0)),
+                str(screenshot_path) if screenshot_path else None,
+                payload.get("answer_text", "")[:20000],
+                json.dumps(payload.get("answer_debug") or {}, ensure_ascii=False)[:20000],
+                json.dumps(payload.get("run_debug") or [], ensure_ascii=False)[:40000],
+                payload.get("error"),
+                now(),
+                payload["task_id"],
+            ),
+        )
+
+    result_exported = False
+    if screenshot_path:
+        try:
             write_result_to_excel(payload, screenshot_path)
-            # 图片已嵌入 Excel，删除本地截图文件避免堆积
-            try:
-                Path(screenshot_path).unlink()
-            except Exception:
-                pass
+            result_exported = True
+            Path(screenshot_path).unlink(missing_ok=True)
+        except Exception as exc:
+            print(f"结果表写入暂缓，稍后会从 SQLite 自动补齐：{exc}")
 
-        with connect_db() as conn:
-            conn.execute(
-                """
-                update tasks
-                set status = ?,
-                    matched = ?,
-                    followup_count = ?,
-                    screenshot_path = ?,
-                    answer_text = ?,
-                    answer_debug = ?,
-                    run_debug = ?,
-                    error = ?,
-                    updated_at = ?
-                where task_id = ?
-                """,
-                (
-                    task_status,
-                    1 if matched else 0,
-                    int(payload.get("followup_count", 0)),
-                    str(screenshot_path) if screenshot_path else None,
-                    payload.get("answer_text", "")[:20000],
-                    json.dumps(payload.get("answer_debug") or {}, ensure_ascii=False)[:20000],
-                    json.dumps(payload.get("run_debug") or [], ensure_ascii=False)[:40000],
-                    payload.get("error"),
-                    now(),
-                    payload["task_id"],
-                ),
-            )
+    if not result_exported:
+        sync_result_from_db()
 
-    return {"ok": True, "screenshot_path": str(screenshot_path) if screenshot_path else None}
+    return {
+        "ok": True,
+        "screenshot_path": str(screenshot_path) if screenshot_path else None,
+        "result_exported": result_exported,
+    }
 
 
 def judge_answer(payload):
@@ -825,11 +894,6 @@ def mark_failed(payload):
     if not task_id:
         raise ValueError("缺少 task_id")
 
-    failed_payload = dict(payload)
-    failed_payload["status"] = "failed"
-    failed_payload["matched"] = False
-    write_temp_answer_sheet(failed_payload)
-
     with connect_db() as conn:
         conn.execute(
             """
@@ -845,6 +909,15 @@ def mark_failed(payload):
                 task_id,
             ),
         )
+
+    failed_payload = dict(payload)
+    failed_payload["status"] = "failed"
+    failed_payload["matched"] = False
+    try:
+        write_temp_answer_sheet(failed_payload)
+    except Exception as exc:
+        print(f"临时回答表写入暂缓（失败状态已保存）：{exc}")
+    sync_result_from_db()
     return {"ok": True}
 
 
@@ -1136,11 +1209,13 @@ def create_service_server():
     server = ReusableThreadingHTTPServer((HOST, PORT), Handler)
     try:
         init_db()
+        recovered = recover_interrupted_tasks()
         created = seed_tasks()
+        sync_result_from_db()
     except Exception:
         server.server_close()
         raise
-    print(f"已准备任务，新增 {created} 条")
+    print(f"已准备任务，新增 {created} 条，恢复中断任务 {recovered} 条")
     print(f"输入 Excel：{INPUT_EXCEL}")
     print(f"结果 Excel：{RESULT_EXCEL}")
     print(f"截图目录：{SCREENSHOT_DIR}")
