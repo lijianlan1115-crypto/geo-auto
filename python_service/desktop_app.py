@@ -20,6 +20,8 @@ def application_dir():
 
 
 def project_dir():
+    if getattr(sys, "frozen", False):
+        return application_dir().parent
     return application_dir().parent.parent
 
 

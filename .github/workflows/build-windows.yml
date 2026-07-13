@@ -33,8 +33,8 @@ jobs:
       - name: Create delivery ZIP
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release/GEO反馈自动化_Windows | Out-Null
-          Copy-Item "python_service/GEO反馈自动化.exe" "release/GEO反馈自动化_Windows/"
+          New-Item -ItemType Directory -Force -Path release/GEO反馈自动化_Windows/python_service | Out-Null
+          Copy-Item "python_service/GEO反馈自动化.exe" "release/GEO反馈自动化_Windows/python_service/"
           Copy-Item chrome_extension "release/GEO反馈自动化_Windows/chrome_extension" -Recurse
           Copy-Item 使用说明.md "release/GEO反馈自动化_Windows/"
           Compress-Archive -Path "release/GEO反馈自动化_Windows" -DestinationPath "release/GEO反馈自动化_Windows.zip" -Force
