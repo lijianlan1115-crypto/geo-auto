@@ -864,7 +864,7 @@ def compact_text(value, limit=None):
     return text[:limit] if limit else text
 
 
-def write_temp_answer_sheet(payload):
+def _write_temp_answer_sheet_unlocked(payload):
     headers = [
         "更新时间", "task_id", "行号", "平台", "状态", "是否命中", "命中关键词",
         "追问次数", "回答长度", "题目", "目标关键词", "回答片段", "完整回答", "每轮调试"
@@ -925,7 +925,13 @@ def write_temp_answer_sheet(payload):
     widths = {1: 20, 2: 18, 4: 14, 6: 10, 7: 24, 10: 42, 11: 26, 12: 70, 13: 90, 14: 90}
     for col, width in widths.items():
         ws.column_dimensions[col_letter(ws, col)].width = max(ws.column_dimensions[col_letter(ws, col)].width or 0, width)
-    wb.save(TEMP_ANSWERS_EXCEL)
+    save_workbook_atomic(wb, TEMP_ANSWERS_EXCEL)
+
+
+def write_temp_answer_sheet(payload):
+    """每个平台完成后立即落一份轻量 Excel，供中断恢复和人工核对。"""
+    with lock:
+        return _write_temp_answer_sheet_unlocked(payload)
 
 
 def add_screenshot_to_worksheet(ws, screenshot_path, row_number, image_col):
@@ -1108,6 +1114,13 @@ def submit_result(payload):
                 payload["task_id"],
             ),
         )
+
+    # 主结果表含大量图片，写入会随文件增大而变慢。先把文本、命中状态和
+    # 调试信息保存到轻量临时表；即使随后程序被关闭，已完成结果也不会消失。
+    try:
+        write_temp_answer_sheet({**payload, "status": task_status})
+    except Exception as exc:
+        print(f"临时回答表写入暂缓（任务状态已保存在 SQLite）：{exc}")
 
     result_exported = False
     if screenshot_path:

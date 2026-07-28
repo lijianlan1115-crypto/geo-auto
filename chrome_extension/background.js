@@ -76,7 +76,9 @@ async function effectiveTaskKeywords(task) {
   const data = await chrome.storage.local.get(["keyword"]);
   const taskKeywords = splitKeywords(task.keywords || task.keyword);
   const configuredKeywords = splitKeywords(data.keyword);
-  return configuredKeywords.length ? configuredKeywords : taskKeywords;
+  // Excel 每一行的目标关键词必须优先。面板关键词只在任务本身没有关键词时兜底，
+  // 否则不同问题会错误地用同一组全局关键词定位正文和截图。
+  return taskKeywords.length ? taskKeywords : configuredKeywords;
 }
 
 async function runOneTask(task) {
@@ -153,6 +155,7 @@ async function runOneTask(task) {
         task_id: task.task_id,
         row_number: task.row_number,
         row_id: task.row_id,
+        question: task.question,
         platform: task.platform,
         matched: Boolean(result && result.matched),
         matched_keywords: result && result.matched_keywords ? result.matched_keywords : [],
@@ -183,6 +186,7 @@ async function runOneTask(task) {
             task_id: task.task_id,
             row_number: task.row_number,
             row_id: task.row_id,
+            question: task.question,
             platform: task.platform,
             matched: false,
             matched_keywords: [],

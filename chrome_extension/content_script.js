@@ -1236,7 +1236,10 @@ async function waitAnswerStable(task, previousText = "") {
 
 async function waitForFinalAnswerRender(task, fallbackText = "") {
   const pollMs = Math.max(300, Number(task.answer_poll_interval || 0.8) * 1000);
-  const settleMs = Math.max(3000, Number(task.answer_final_settle_seconds || 8) * 1000);
+  // waitAnswerStable 已经确认回答停止生成，这里只留一个短渲染缓冲，
+  // 避免每个平台在截图前固定再等待 8 秒。
+  const configuredSettleMs = Number(task.answer_final_settle_seconds || 2) * 1000;
+  const settleMs = Math.max(1200, Math.min(2500, configuredSettleMs));
   const minAnswerChars = Math.max(20, Number(task.answer_min_chars || 40));
   const timeoutMs = Math.max(settleMs + 3000, Number(task.answer_timeout_seconds || 90) * 1000);
   const started = Date.now();
@@ -1500,6 +1503,48 @@ function findKeywordRangesInDOM(root, keyword) {
 
       index = normalized.indexOf(keywordNormalized, index + keywordNormalized.length);
     }
+  }
+
+  if (results.length) return results;
+
+  // 千问会把一个词拆进多个 span/text node。逐节点搜索无法命中这种正文，
+  // 因此在快速路径失败后，建立跨文本节点的字符坐标并生成一个跨节点 Range。
+  const rootText = normalizeKeywordText(root.textContent || "");
+  if (!keywordNormalized || !rootText.includes(keywordNormalized)) return results;
+
+  const crossWalker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const normalizedChars = [];
+  const positions = [];
+  const ignoredChar = /\s|[，。！？、,.!?]/;
+  while (crossWalker.nextNode() && normalizedChars.length < 200000) {
+    const node = crossWalker.currentNode;
+    if (!node.parentElement || isIgnoredLocateNode(node.parentElement)) continue;
+    const raw = node.nodeValue || "";
+    for (let offset = 0; offset < raw.length; offset++) {
+      if (ignoredChar.test(raw[offset])) continue;
+      normalizedChars.push(raw[offset]);
+      positions.push({ node, offset });
+    }
+  }
+
+  const flattened = normalizedChars.join("");
+  let crossIndex = flattened.indexOf(keywordNormalized);
+  while (crossIndex >= 0) {
+    const start = positions[crossIndex];
+    const end = positions[crossIndex + keywordNormalized.length - 1];
+    if (start && end) {
+      const range = document.createRange();
+      range.setStart(start.node, start.offset);
+      range.setEnd(end.node, Math.min((end.node.nodeValue || "").length, end.offset + 1));
+      results.push({
+        range,
+        node: start.node,
+        keyword,
+        context: getKeywordContext(root.textContent || "", Math.max(0, crossIndex), keyword.length),
+        source: "cross_node_text",
+      });
+    }
+    crossIndex = flattened.indexOf(keywordNormalized, crossIndex + keywordNormalized.length);
   }
 
   return results;
@@ -2057,15 +2102,19 @@ async function findQianwenKeywordMatchesByScroll(searchTerms) {
   let matches = findQianwenKeywordMatches(searchTerms);
   if (matches.length) return matches;
 
-  const containers = uniqueNodes(scrollableContainers(document.body));
+  // 千问是虚拟滚动页面，只检查最可能的三个主滚动容器，避免遍历页面
+  // 每一个可滚动小组件并在每个位置等待近一秒。
+  const containers = uniqueNodes(scrollableContainers(document.body))
+    .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))
+    .slice(0, 3);
   for (const container of containers) {
     const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
     const step = Math.max(260, Math.floor((container.clientHeight || window.innerHeight) * 0.55));
     const positions = uniqueList([container.scrollTop || 0, 0, ...Array.from({ length: Math.ceil(maxScroll / step) + 1 }, (_, i) => i * step), maxScroll])
       .map((value) => Math.max(0, Math.min(maxScroll, Math.round(Number(value) || 0))));
-    for (const top of positions) {
+    for (const top of positions.slice(0, 10)) {
       container.scrollTo({ top, behavior: "instant" });
-      await waitForScrollStable(900, container);
+      await waitForScrollStable(600, container);
       matches = findQianwenKeywordMatches(searchTerms);
       if (matches.length) return matches;
     }
@@ -2075,9 +2124,9 @@ async function findQianwenKeywordMatchesByScroll(searchTerms) {
   const step = Math.max(300, Math.floor(window.innerHeight * 0.55));
   const positions = uniqueList([window.scrollY, 0, ...Array.from({ length: Math.ceil(maxScroll / step) + 1 }, (_, i) => i * step), maxScroll])
     .map((value) => Math.max(0, Math.min(maxScroll, Math.round(Number(value) || 0))));
-  for (const top of positions) {
+  for (const top of positions.slice(0, 10)) {
     window.scrollTo({ top, behavior: "instant" });
-    await waitForScrollStable(900);
+    await waitForScrollStable(600);
     matches = findQianwenKeywordMatches(searchTerms);
     if (matches.length) return matches;
   }
@@ -2266,15 +2315,16 @@ async function drawKeywordAndEnsureViewport(match) {
 }
 
 async function drawKeywordAndEnsureViewportSmooth(match) {
-  await smoothScrollKeywordToCenter(match.range, 4200);
-  await forceCenterQianwenMatch(match, 1400);
+  scrollKeywordToCenter(match.range);
+  await waitForScrollStable(800, nearestScrollableContainer(match.range.startContainer));
+  await forceCenterQianwenMatch(match, 700);
   let rects = drawDOMKeywordBoxes([match]);
   await new Promise((resolve) => requestAnimationFrame(resolve));
   await sleep(220);
   if (!keywordMarkFullyInViewport()) {
     clearKeywordMarks();
-    await smoothScrollKeywordToCenter(match.range, 4200);
-    await forceCenterQianwenMatch(match, 1400);
+    scrollKeywordToCenter(match.range);
+    await waitForScrollStable(800, nearestScrollableContainer(match.range.startContainer));
     rects = drawDOMKeywordBoxes([match]);
     await sleep(220);
   }
@@ -2534,6 +2584,30 @@ async function buildSmartFollowupPrompt(followupCount, keywords, previousQuestio
 }
 
 async function judgeAnswer(answerText, keywords, task) {
+  const normalizedAnswer = normalizeKeywordText(answerText || "");
+  for (const keyword of splitKeywords(keywords)) {
+    const aliases = typeof keywordAliasesForPrompt === "function"
+      ? keywordAliasesForPrompt([keyword])
+      : [keyword];
+    const matchedAlias = aliases.find((alias) => {
+      const normalizedAlias = normalizeKeywordText(alias);
+      return normalizedAlias && normalizedAnswer.includes(normalizedAlias);
+    });
+    if (matchedAlias) {
+      return {
+        ok: true,
+        has_answer: normalizedAnswer.length >= 20,
+        matched: true,
+        keyword,
+        matched_text: matchedAlias,
+        match_type: "browser_direct_text",
+        confidence: 1,
+        source: "browser_direct",
+        reason: "回答正文已直接出现当前行目标关键词，立即停止追问",
+      };
+    }
+  }
+
   const response = await runtimeMessage({
     action: "JUDGE_ANSWER",
     answer_text: answerText || "",
@@ -2642,8 +2716,9 @@ async function runPlatformTask(task) {
     // 总是显示命中小标签，确保截图中能看到
     drawMatchedBadge(matchedKeywords);
 
-    // 尝试绘制红框，最多重试 2 轮
-    for (let attempt = 0; attempt < 2; attempt++) {
+    // 千问已经包含专用定位流程，只尝试一轮；其他平台保留一次兜底重试。
+    const locateAttempts = task.platform === "qianwen" ? 1 : 2;
+    for (let attempt = 0; attempt < locateAttempts; attempt++) {
       if (domLocation && domLocation.matched && visibleKeywordMarkExists() && keywordMarkFullyInViewport()) break;
 
       clearKeywordMarks();
@@ -2692,7 +2767,7 @@ async function runPlatformTask(task) {
 
     // 等待渲染确保红框显示在屏幕上
     await new Promise((resolve) => requestAnimationFrame(resolve));
-    await sleep(task.platform === "qianwen" ? 900 : 500);
+    await sleep(task.platform === "qianwen" ? 300 : 500);
 
     // 如果网页层红框还是不可见，保留 domLocation，后面截图后会直接在图片上补框。
     const imageFallbackRect = domLocation && domLocation.first_rect
