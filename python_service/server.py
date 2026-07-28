@@ -6,10 +6,13 @@ import shutil
 import sqlite3
 import threading
 import time
+import uuid
+import zipfile
+from contextlib import contextmanager
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import config as service_config
 from config import (
@@ -40,7 +43,13 @@ from config import (
 
 from ocr_checker import check_keyword
 from image_marker import mark_image
-from ai_judge import ai_judge, configure_ai_judge, generate_followup, get_ai_judge_config
+from ai_judge import (
+    ai_judge,
+    configure_ai_judge,
+    generate_followup,
+    get_ai_judge_config,
+    prefetch_target_research,
+)
 
 try:
     from openpyxl import Workbook, load_workbook
@@ -50,7 +59,11 @@ except ImportError as exc:
     raise SystemExit("缺少 openpyxl，请先安装：pip install openpyxl") from exc
 
 
-lock = threading.Lock()
+# SQLite and Excel exports are both touched by request-handler threads.
+# Use one re-entrant lock so every workbook load -> mutate -> save sequence is
+# serialized, including recovery paths that call another lock-aware helper.
+lock = threading.RLock()
+TARGET_PLATFORM_CONTEXT_PATH = OUTPUT_DIR / "target_platform_context_cache.json"
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -68,46 +81,148 @@ def ensure_dirs():
         (SCREENSHOT_DIR / platform).mkdir(parents=True, exist_ok=True)
 
 
+def validate_workbook_file(path):
+    """完整检查 xlsx 容器和工作簿结构，损坏时直接抛出异常。"""
+    workbook_path = Path(path)
+    if not workbook_path.is_file() or workbook_path.stat().st_size == 0:
+        raise ValueError(f"Excel 文件不存在或为空：{workbook_path}")
+
+    required_entries = {"[Content_Types].xml", "xl/workbook.xml"}
+    try:
+        with zipfile.ZipFile(workbook_path, "r") as archive:
+            names = set(archive.namelist())
+            missing = required_entries - names
+            if missing:
+                raise ValueError(f"Excel 缺少必要内容：{sorted(missing)}")
+            damaged_entry = archive.testzip()
+            if damaged_entry:
+                raise ValueError(f"Excel 压缩内容损坏：{damaged_entry}")
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ValueError(f"Excel 文件结构损坏：{workbook_path}") from exc
+
+    verification = None
+    try:
+        verification = load_workbook(workbook_path, read_only=True, data_only=False)
+        if not verification.sheetnames:
+            raise ValueError("Excel 中没有工作表")
+        # 强制读取每张表的范围，避免只打开 ZIP 而没有解析工作表 XML。
+        for worksheet in verification.worksheets:
+            worksheet.calculate_dimension(force=True)
+    except Exception as exc:
+        raise ValueError(f"Excel 工作簿无法重新打开：{workbook_path}") from exc
+    finally:
+        if verification is not None:
+            verification.close()
+
+
+def flush_file_to_disk(path):
+    """请求操作系统把临时文件刷新到磁盘后再执行替换。"""
+    with Path(path).open("rb") as stream:
+        os.fsync(stream.fileno())
+
+
+def preserve_last_good_workbook(target):
+    """保存当前结果的轻量备份，供最终文件校验失败时回滚。"""
+    if not target.exists():
+        return None
+
+    backup = target.with_name(f".{target.name}.last-good.xlsx")
+    pending_backup = target.with_name(
+        f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.backup.tmp.xlsx"
+    )
+    try:
+        try:
+            os.link(target, pending_backup)
+        except OSError:
+            shutil.copy2(target, pending_backup)
+        flush_file_to_disk(pending_backup)
+        os.replace(pending_backup, backup)
+        return backup
+    finally:
+        if pending_backup.exists():
+            pending_backup.unlink()
+
+
 def save_workbook_atomic(workbook, target_path):
     global RESULT_EXCEL
 
     target = Path(target_path)
-    temp = target.with_name(f".{target.stem}.{os.getpid()}.tmp.xlsx")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(
+        f".{target.stem}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp.xlsx"
+    )
+    backup = None
+    final_target = target
     try:
         workbook.save(temp)
     finally:
         workbook.close()
 
     try:
+        # 临时文件不通过完整性检查时，绝不覆盖用户可见的结果文件。
+        validate_workbook_file(temp)
+        flush_file_to_disk(temp)
+        backup = preserve_last_good_workbook(target)
+
         for attempt in range(5):
             try:
-                os.replace(temp, target)
-                return
+                os.replace(temp, final_target)
+                break
             except PermissionError as exc:
                 if attempt == 4:
                     # 某些 Windows 环境会被资源管理器预览、同步软件或安全软件
                     # 短暂锁定目标文件。结果表无法覆盖时，自动改写到新文件，
                     # 使当前任务继续运行而不是整体失败。
-                    if target == RESULT_EXCEL:
+                    if final_target == RESULT_EXCEL:
                         fallback = create_result_excel_path(target.parent)
                         os.replace(temp, fallback)
                         RESULT_EXCEL = fallback
                         service_config.RESULT_EXCEL = fallback
+                        final_target = fallback
                         print(f"结果表被占用，已自动切换到新文件：{fallback}")
-                        return
-                    raise PermissionError(
-                        f"无法写入结果文件：{target}。请关闭 Excel/WPS、资源管理器预览窗格或同步工具后重试。"
-                    ) from exc
+                        break
+                    else:
+                        raise PermissionError(
+                            f"无法写入结果文件：{target}。请关闭 Excel/WPS、资源管理器预览窗格或同步工具后重试。"
+                        ) from exc
                 time.sleep(0.6)
+
+        # 再校验最终路径，确保复制、同步或磁盘写入后用户拿到的仍是完整文件。
+        validate_workbook_file(final_target)
+        flush_file_to_disk(final_target)
+
+        if backup and backup.exists():
+            backup.unlink()
+        return final_target
+    except Exception:
+        # 替换后若最终校验失败，恢复此前的有效结果，损坏文件不会留在正式路径。
+        if backup and backup.exists() and final_target == target:
+            os.replace(backup, target)
+        elif final_target != target and final_target.exists():
+            invalid = final_target.with_name(
+                f".{final_target.name}.{int(time.time())}.invalid"
+            )
+            os.replace(final_target, invalid)
+        raise
     finally:
         if temp.exists():
             temp.unlink()
+        if backup and backup.exists():
+            backup.unlink()
 
 
+@contextmanager
 def connect_db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -389,15 +504,140 @@ def seed_tasks(clear_outputs=False):
     return created
 
 
-def get_next_task():
+def target_context_key(keywords):
+    normalized = [str(item or "").strip() for item in (keywords or []) if str(item or "").strip()]
+    return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
+
+def load_target_platform_context_cache():
+    try:
+        data = json.loads(TARGET_PLATFORM_CONTEXT_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_target_platform_context_cache(data):
+    ensure_dirs()
+    temp_path = TARGET_PLATFORM_CONTEXT_PATH.with_name(
+        f".{TARGET_PLATFORM_CONTEXT_PATH.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp_path, TARGET_PLATFORM_CONTEXT_PATH)
+
+
+def pending_target_keyword_groups():
+    groups = {}
+    with connect_db() as conn:
+        rows = conn.execute(
+            "select answer_text from tasks where status in ('pending', 'running', 'failed')"
+        ).fetchall()
+    cache = load_target_platform_context_cache()
+    for row in rows:
+        try:
+            keywords = json.loads(row["answer_text"] or "{}").get("keywords") or []
+        except Exception:
+            keywords = []
+        keywords = [str(item or "").strip() for item in keywords if str(item or "").strip()]
+        if not keywords:
+            continue
+        key = target_context_key(keywords)
+        cached = cache.get(key) if isinstance(cache.get(key), dict) else {}
+        groups[key] = {
+            "keywords": keywords,
+            "cached_platforms": sorted((cached.get("platforms") or {}).keys()),
+        }
+    return {"ok": True, "groups": list(groups.values())}
+
+
+def save_target_platform_context(payload):
+    keywords = payload.get("keywords") or []
+    if not isinstance(keywords, list):
+        keywords = split_keywords(keywords)
+    keywords = [str(item or "").strip() for item in keywords if str(item or "").strip()]
+    platform = str(payload.get("platform") or "").strip()
+    answer_text = str(payload.get("answer_text") or "").strip()
+    if not keywords or not platform:
+        raise ValueError("目标预搜索缺少关键词或平台")
+
+    with lock:
+        cache = load_target_platform_context_cache()
+        key = target_context_key(keywords)
+        entry = cache.get(key) if isinstance(cache.get(key), dict) else {}
+        platforms = entry.get("platforms") if isinstance(entry.get("platforms"), dict) else {}
+        platforms[platform] = {
+            "ok": bool(payload.get("ok")) and len(answer_text) >= 20,
+            "answer_text": answer_text[:8000],
+            "error": str(payload.get("error") or "")[:500],
+            "updated_at": now(),
+        }
+        cache[key] = {"keywords": keywords, "platforms": platforms, "updated_at": now()}
+        save_target_platform_context_cache(cache)
+    return {"ok": True, "saved": True, "platform": platform}
+
+
+def get_target_platform_context(keywords):
+    entry = load_target_platform_context_cache().get(target_context_key(keywords)) or {}
+    platforms = entry.get("platforms") if isinstance(entry, dict) else {}
+    parts = []
+    for platform, item in (platforms or {}).items():
+        if not isinstance(item, dict) or not item.get("ok"):
+            continue
+        text = str(item.get("answer_text") or "").strip()
+        if text:
+            parts.append(f"[{platform}预搜索回答]\n{text[:2600]}")
+    return "\n\n".join(parts)[:7000]
+
+
+def clear_target_platform_context_cache():
+    try:
+        TARGET_PLATFORM_CONTEXT_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def prefetch_pending_target_research():
+    """服务启动后后台预取每组目标资料，不阻塞领取任务。"""
+    keyword_groups = set()
+    with connect_db() as conn:
+        rows = conn.execute(
+            "select answer_text from tasks where status in ('pending', 'running', 'failed')"
+        ).fetchall()
+    for row in rows:
+        try:
+            keywords = json.loads(row["answer_text"] or "{}").get("keywords") or []
+        except Exception:
+            keywords = []
+        normalized = tuple(str(item).strip() for item in keywords if str(item).strip())
+        if normalized:
+            keyword_groups.add(normalized)
+    for keywords in keyword_groups:
+        prefetch_target_research(list(keywords))
+    return len(keyword_groups)
+
+
+def get_next_task(excluded_platforms=None):
+    excluded_platforms = [
+        str(platform).strip()
+        for platform in (excluded_platforms or [])
+        if str(platform).strip() in PLATFORMS
+    ]
+    where_sql = "status = 'pending'"
+    params = []
+    if excluded_platforms:
+        placeholders = ", ".join("?" for _ in excluded_platforms)
+        where_sql += f" and platform not in ({placeholders})"
+        params.extend(excluded_platforms)
+
     with lock, connect_db() as conn:
         task = conn.execute(
-            """
+            f"""
             select * from tasks
-            where status = 'pending'
+            where {where_sql}
             order by row_number asc, platform asc
             limit 1
-            """
+            """,
+            params,
         ).fetchone()
 
         if not task:
@@ -688,87 +928,105 @@ def write_temp_answer_sheet(payload):
     wb.save(TEMP_ANSWERS_EXCEL)
 
 
-def write_result_to_excel(result, screenshot_path):
-    wb = load_workbook(RESULT_EXCEL)
-    ws = wb.active
-    headers = read_headers(ws)
-    migrate_images_inside_cells(ws)
-
-    platform = result["platform"]
-    platform_config = PLATFORMS[platform]
-    image_col = headers[platform_config["column"]]
-    status_col = headers[f"{platform_config['column']}_状态"]
-    followup_col = headers[f"{platform_config['column']}_追问次数"]
-    row_number = int(result["row_number"])
-
-    matched = bool(result.get("matched"))
-    matched_keywords = result.get("matched_keywords") or []
-    error_text = str(result.get("error") or "").strip()
-    if error_text:
-        status_text = f"失败：{compact_text(error_text, 60)}"
-    elif matched and matched_keywords:
-        status_text = f"命中：{'，'.join(matched_keywords)}"
-    else:
-        status_text = "命中" if matched else "未命中"
-
-    ws.cell(row=row_number, column=status_col, value=status_text)
-    ws.cell(row=row_number, column=followup_col, value=int(result.get("followup_count", 0)))
-
+def add_screenshot_to_worksheet(ws, screenshot_path, row_number, image_col):
+    if not screenshot_path or not Path(screenshot_path).exists():
+        return False
     image_cell = f"{col_letter(ws, image_col)}{row_number}"
     remove_images_at_cell(ws, image_cell)
+    img = ExcelImage(str(screenshot_path))
+    original_width = max(1, int(getattr(img, "width", 1) or 1))
+    original_height = max(1, int(getattr(img, "height", 1) or 1))
+    max_width = 520
+    max_height = 330
+    scale = min(max_width / original_width, max_height / original_height, 1.0)
+    if original_width > max_width or original_height > max_height:
+        img.width = int(original_width * scale)
+        img.height = int(original_height * scale)
 
-    if screenshot_path and Path(screenshot_path).exists():
-        img = ExcelImage(str(screenshot_path))
-        original_width = max(1, int(getattr(img, "width", 1) or 1))
-        original_height = max(1, int(getattr(img, "height", 1) or 1))
-        max_width = 520
-        max_height = 330
-        scale = min(max_width / original_width, max_height / original_height, 1.0)
-        if original_width > max_width or original_height > max_height:
-            img.width = int(original_width * scale)
-            img.height = int(original_height * scale)
+    ws.row_dimensions[row_number].height = max(
+        ws.row_dimensions[row_number].height or 0,
+        int(img.height * 0.75) + 12,
+    )
+    ws.column_dimensions[col_letter(ws, image_col)].width = max(
+        ws.column_dimensions[col_letter(ws, image_col)].width or 0,
+        min(76, max(38, img.width / 7)),
+    )
+    anchor_image_inside_cell(img, row_number, image_col)
+    ws.add_image(img)
+    return True
 
-        ws.row_dimensions[row_number].height = max(ws.row_dimensions[row_number].height or 0, int(img.height * 0.75) + 12)
-        ws.column_dimensions[col_letter(ws, image_col)].width = max(
-            ws.column_dimensions[col_letter(ws, image_col)].width or 0, min(76, max(38, img.width / 7))
-        )
-        anchor_image_inside_cell(img, row_number, image_col)
-        ws.add_image(img)
 
-    save_workbook_atomic(wb, RESULT_EXCEL)
+def write_result_to_excel(result, screenshot_path):
+    with lock:
+        wb = load_workbook(RESULT_EXCEL)
+        ws = wb.active
+        headers = read_headers(ws)
+        migrate_images_inside_cells(ws)
+
+        platform = result["platform"]
+        platform_config = PLATFORMS[platform]
+        image_col = headers[platform_config["column"]]
+        status_col = headers[f"{platform_config['column']}_状态"]
+        followup_col = headers[f"{platform_config['column']}_追问次数"]
+        row_number = int(result["row_number"])
+
+        matched = bool(result.get("matched"))
+        matched_keywords = result.get("matched_keywords") or []
+        error_text = str(result.get("error") or "").strip()
+        if error_text:
+            status_text = f"失败：{compact_text(error_text, 60)}"
+        elif matched and matched_keywords:
+            status_text = f"命中：{'，'.join(matched_keywords)}"
+        else:
+            status_text = "命中" if matched else "未命中"
+
+        ws.cell(row=row_number, column=status_col, value=status_text)
+        ws.cell(row=row_number, column=followup_col, value=int(result.get("followup_count", 0)))
+
+        add_screenshot_to_worksheet(ws, screenshot_path, row_number, image_col)
+
+        save_workbook_atomic(wb, RESULT_EXCEL)
 
 
 def sync_result_from_db():
     """将 SQLite 中已完成的状态补写到结果表；导出失败不影响任务状态。"""
     try:
-        prepare_workbook()
-        with connect_db() as conn:
-            rows = conn.execute(
-                """
-                select row_number, platform, status, matched, followup_count, error
-                from tasks
-                where status in ('done', 'failed')
-                """
-            ).fetchall()
+        with lock:
+            prepare_workbook()
+            with connect_db() as conn:
+                rows = conn.execute(
+                    """
+                    select row_number, platform, status, matched, followup_count, screenshot_path, error
+                    from tasks
+                    where status in ('done', 'failed')
+                    """
+                ).fetchall()
 
-        wb = load_workbook(RESULT_EXCEL)
-        ws = wb.active
-        headers = read_headers(ws)
-        for task in rows:
-            platform = PLATFORMS.get(task["platform"])
-            if not platform:
-                continue
-            status_col = headers.get(f"{platform['column']}_状态")
-            followup_col = headers.get(f"{platform['column']}_追问次数")
-            if not status_col or not followup_col:
-                continue
-            if task["status"] == "failed":
-                status_text = f"失败：{compact_text(task['error'], 60)}"
-            else:
-                status_text = "命中" if task["matched"] else "未命中"
-            ws.cell(row=int(task["row_number"]), column=status_col, value=status_text)
-            ws.cell(row=int(task["row_number"]), column=followup_col, value=int(task["followup_count"] or 0))
-        save_workbook_atomic(wb, RESULT_EXCEL)
+            wb = load_workbook(RESULT_EXCEL)
+            ws = wb.active
+            headers = read_headers(ws)
+            for task in rows:
+                platform = PLATFORMS.get(task["platform"])
+                if not platform:
+                    continue
+                status_col = headers.get(f"{platform['column']}_状态")
+                followup_col = headers.get(f"{platform['column']}_追问次数")
+                image_col = headers.get(platform["column"])
+                if not status_col or not followup_col or not image_col:
+                    continue
+                if task["status"] == "failed":
+                    status_text = f"失败：{compact_text(task['error'], 60)}"
+                else:
+                    status_text = "命中" if task["matched"] else "未命中"
+                ws.cell(row=int(task["row_number"]), column=status_col, value=status_text)
+                ws.cell(row=int(task["row_number"]), column=followup_col, value=int(task["followup_count"] or 0))
+                add_screenshot_to_worksheet(
+                    ws,
+                    task["screenshot_path"],
+                    int(task["row_number"]),
+                    image_col,
+                )
+            save_workbook_atomic(wb, RESULT_EXCEL)
         return True
     except Exception as exc:
         print(f"结果表同步暂缓（任务状态已保存在 SQLite）：{exc}")
@@ -856,7 +1114,6 @@ def submit_result(payload):
         try:
             write_result_to_excel(payload, screenshot_path)
             result_exported = True
-            Path(screenshot_path).unlink(missing_ok=True)
         except Exception as exc:
             print(f"结果表写入暂缓，稍后会从 SQLite 自动补齐：{exc}")
 
@@ -889,8 +1146,14 @@ def generate_followup_prompt(payload):
     keywords = payload.get("keywords") or split_keywords(payload.get("keyword") or KEYWORD)
     if not isinstance(keywords, list):
         keywords = split_keywords(keywords)
+    question_context = payload.get("question") or ""
+    platform_context = get_target_platform_context(keywords)
+    if isinstance(question_context, dict) and platform_context:
+        question_context = {**question_context, "target_platform_context": platform_context}
+    if isinstance(question_context, dict) and payload.get("task_id") and not question_context.get("task_id"):
+        question_context = {**question_context, "task_id": str(payload.get("task_id"))}
     return generate_followup(
-        question=payload.get("question") or "",
+        question=question_context,
         answer_text=payload.get("answer_text") or "",
         keywords=keywords,
         followup_count=payload.get("followup_count") or 0,
@@ -963,6 +1226,50 @@ def stats():
         return {row["status"]: row["count"] for row in rows}
 
 
+def finalize_batch():
+    """Export the completed batch, then clear SQLite's temporary task records."""
+    with lock:
+        summary = stats()
+        if int(summary.get("pending", 0) or 0) or int(summary.get("running", 0) or 0):
+            return {
+                "ok": False,
+                "cleared": False,
+                "error": "仍有待执行或运行中的任务，不能清空临时进度",
+                "stats": summary,
+            }
+        if not int(summary.get("done", 0) or 0) and not int(summary.get("failed", 0) or 0):
+            return {"ok": True, "cleared": True, "already_empty": True, "stats": summary}
+
+        # SQLite is only temporary recovery state. Never clear it until every
+        # finished/failed row has been synchronized to the result workbook.
+        if not sync_result_from_db():
+            return {
+                "ok": False,
+                "cleared": False,
+                "error": "结果 Excel 尚未同步成功，已保留 SQLite 进度",
+                "stats": summary,
+            }
+
+        with connect_db() as conn:
+            conn.execute("delete from tasks")
+
+        # Keep a tiny empty schema file so health checks remain available, while
+        # removing all batch data and truncating SQLite's transient WAL content.
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            conn.execute("pragma wal_checkpoint(TRUNCATE)")
+            conn.execute("vacuum")
+
+        clear_target_platform_context_cache()
+
+        return {
+            "ok": True,
+            "cleared": True,
+            "stats_before_clear": summary,
+            "stats": {},
+            "result_excel": str(RESULT_EXCEL),
+        }
+
+
 def reset_failed_tasks():
     with connect_db() as conn:
         cursor = conn.execute(
@@ -985,6 +1292,7 @@ def reset_failed_tasks():
 def reset_all_tasks():
     with connect_db() as conn:
         conn.execute("delete from tasks")
+    clear_target_platform_context_cache()
     if RESULT_EXCEL.exists():
         RESULT_EXCEL.unlink()
     created = seed_tasks(clear_outputs=True)
@@ -1041,10 +1349,16 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
         elif path == "/next-task":
-            task = get_next_task()
+            query = parse_qs(urlparse(self.path).query)
+            excluded_platforms = []
+            for value in query.get("exclude_platforms", []):
+                excluded_platforms.extend(value.split(","))
+            task = get_next_task(excluded_platforms)
             self._send(200, {"ok": True, "task": task})
         elif path == "/test-keywords":
             self._send(200, get_test_keywords())
+        elif path == "/target-keyword-groups":
+            self._send(200, pending_target_keyword_groups())
         elif path == "/ai-judge-config":
             self._send(200, get_ai_judge_config())
         elif path == "/debug/recent":
@@ -1204,6 +1518,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, reset_failed_tasks())
             elif path == "/reset-all-tasks":
                 self._send(200, reset_all_tasks())
+            elif path == "/finalize-batch":
+                self._send(200, finalize_batch())
+            elif path == "/target-platform-context":
+                self._send(200, save_target_platform_context(payload))
             else:
                 self._send(404, {"ok": False, "error": "not found"})
         except Exception as exc:
@@ -1220,11 +1538,14 @@ def create_service_server():
         init_db()
         recovered = recover_interrupted_tasks()
         created = seed_tasks()
+        # 直接追问模式不再启动后台目标搜索，避免它与窗口追问争抢同一AI接口。
+        research_groups = 0
         sync_result_from_db()
     except Exception:
         server.server_close()
         raise
     print(f"已准备任务，新增 {created} 条，恢复中断任务 {recovered} 条")
+    print(f"直接追问模式已启用；后台目标搜索组数 {research_groups}")
     print(f"输入 Excel：{INPUT_EXCEL}")
     print(f"结果 Excel：{RESULT_EXCEL}")
     print(f"截图目录：{SCREENSHOT_DIR}")

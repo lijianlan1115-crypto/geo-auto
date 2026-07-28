@@ -83,7 +83,16 @@
   } catch (e) {}
 
   try {
-    buildSmartFollowupPrompt = async function buildSmartFollowupPrompt(followupCount, keywords, previousQuestion, answerText, platform, conversation) {
+    buildSmartFollowupPrompt = async function buildSmartFollowupPrompt(
+      followupCount,
+      keywords,
+      originalQuestion,
+      previousQuestion,
+      answerText,
+      platform,
+      conversation,
+      taskId
+    ) {
       const cleanKeywords = splitKeywordList(keywords);
       if (!cleanKeywords.length) {
         return { prompt: "", source: "error", reason: "缺少目标关键词，已停止追问", real_answer_valid: false };
@@ -95,7 +104,9 @@
       }
 
       const structuredContext = {
-        question: previousQuestion || "",
+        task_id: String(taskId || ""),
+        original_question: originalQuestion || previousQuestion || "",
+        latest_question: previousQuestion || "",
         answer: answerText || "",
         platform: platform || "",
         conversation: cleanConversation(conversation),
@@ -109,13 +120,26 @@
         question: structuredContext,
         platform: platform || "",
         followup_count: followupCount,
+        task_id: String(taskId || ""),
       });
 
       if (!response || !response.ok || !response.prompt) {
         return {
           prompt: "",
           source: "error",
-          reason: response && (response.reason || response.error) ? (response.reason || response.error) : "AI未生成有效追问，已停止追问",
+          reason: response && (response.reason || response.error)
+            ? (response.reason || response.error)
+            : "服务端未能根据当前窗口真实回答生成追问，已停止以避免发送跨场景固定模板",
+          ...answerInfo,
+          conversation_turns: structuredContext.conversation.length,
+          used_structured_context: true,
+        };
+      }
+      if (taskId && String(response.task_id || "") !== String(taskId)) {
+        return {
+          prompt: "",
+          source: "error",
+          reason: `追问任务标识不匹配：期望${String(taskId)},实际${String(response.task_id || "缺失")}`,
           ...answerInfo,
           conversation_turns: structuredContext.conversation.length,
           used_structured_context: true,
@@ -147,18 +171,34 @@
         answer_length: answerInfo.answer_length,
         normalized_answer_length: answerInfo.normalized_answer_length,
         answer_preview: answerInfo.answer_preview,
+        task_id: response.task_id || String(taskId || ""),
+        answer_focus: response.answer_focus || "",
       };
     };
   } catch (e) {}
 
   async function judgeAndPrepareFollowup(answerText, keywords, task, lastPrompt, followupCount, conversation) {
+    const liveHit = liveAnswerKeywordHit(task, keywords, answerText);
+    if (liveHit.matched) {
+      return {
+        judgeResult: { ok: true, has_answer: true, ...liveHit },
+        nextFollowupPromise: Promise.resolve({
+          prompt: "",
+          source: "cancelled_after_live_keyword_hit",
+          reason: "当前页面回答已出现目标词，无需生成追问",
+        }),
+      };
+    }
+
     const nextFollowupPromise = buildSmartFollowupPrompt(
       followupCount,
       keywords,
+      task.question,
       lastPrompt,
       answerText,
       task.platform,
-      conversation
+      conversation,
+      task.task_id
     ).catch((error) => ({
       prompt: "",
       source: "error",
@@ -178,6 +218,36 @@
 
     const judgeResult = await judgePromise;
     return { judgeResult, nextFollowupPromise };
+  }
+
+  function liveAnswerKeywordHit(task, keywords, fallbackAnswerText) {
+    const texts = [String(fallbackAnswerText || ""), String(getAnswerText(task.platform) || "")];
+    try {
+      for (const node of getAnswerCandidates(task.platform).slice(0, 24)) {
+        const text = textFromNode(node);
+        if (text) texts.push(text);
+      }
+    } catch (e) {}
+
+    const aliases = keywordAliasesForPrompt(keywords);
+    for (const text of texts) {
+      const normalized = normalizeText(text);
+      for (const alias of aliases) {
+        const normalizedAlias = normalizeText(alias);
+        if (normalizedAlias && normalized.includes(normalizedAlias)) {
+          return {
+            matched: true,
+            keyword: splitKeywordList(keywords)[0] || alias,
+            matched_text: alias,
+            evidence: text.slice(Math.max(0, text.indexOf(alias) - 80), text.indexOf(alias) + alias.length + 160),
+            answer_text: text,
+            source: "live_page_pre_send_check",
+            reason: "发送追问前在当前页面回答中发现目标词",
+          };
+        }
+      }
+    }
+    return { matched: false };
   }
 
   async function captureTaskScreenshot(task, matched, matchedKeywords, answerText, judgeResult, domLocation) {
@@ -277,7 +347,16 @@
 
   try {
     window.geoAutomationRun = async function geoAutomationRunWithStructuredConversation(task) {
+      const taskId = String(task && task.task_id ? task.task_id : `${task.platform || "unknown"}:${task.question || ""}`);
+      const runToken = `${taskId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+      window.__geoActiveRunToken = runToken;
+      const assertActiveRun = () => {
+        if (window.__geoActiveRunToken !== runToken) {
+          throw new Error(`当前窗口任务已被新的执行替换，停止旧任务以防串线：${taskId}`);
+        }
+      };
       try {
+        assertActiveRun();
         clearKeywordMarks();
         clearMatchedBadges();
 
@@ -294,9 +373,11 @@
         task.keywords = keywords;
 
         let previousText = getAnswerText(task.platform);
+        assertActiveRun();
         await sendPrompt(task.platform, task.question);
         conversation.push({ role: "user", content: task.question });
         answerText = await waitAnswerStable(task, previousText);
+        assertActiveRun();
         conversation.push({ role: "assistant", content: answerText });
 
         let { judgeResult: initialJudge, nextFollowupPromise } = await judgeAndPrepareFollowup(answerText, keywords, task, lastPrompt, followupCount, conversation);
@@ -338,23 +419,62 @@
             const failureReason = followup && followup.reason ? followup.reason : "AI没有生成可用追问";
             runDebug.push({
               round: followupCount + 1,
-              type: "followup_failed",
+              type: "ai_followup_failed_captured_as_unmatched",
               prompt_source: followup && followup.source ? followup.source : "error",
               prompt_reason: failureReason,
               real_answer_valid: followup && followup.real_answer_valid,
               conversation_turns: conversation.length,
               used_structured_context: followup && followup.used_structured_context,
             });
-            throw new Error(`AI追问生成失败：${failureReason}`);
+            judgeResult = {
+              ok: true,
+              has_answer: Boolean(answerText && normalizeText(answerText).length >= 20),
+              matched: false,
+              keyword: "",
+              matched_text: "",
+              evidence: "",
+              source: "ai_followup_failed_no_fallback",
+              reason: `AI追问生成失败，未发送规则模板，按未命中截图：${failureReason}`,
+              ai_followup_failed: true,
+            };
+            matched = false;
+            matchedKeywords = [];
+            break;
+          }
+
+          assertActiveRun();
+          const liveHit = liveAnswerKeywordHit(task, keywords, answerText);
+          if (liveHit.matched) {
+            matched = true;
+            judgeResult = { ok: true, has_answer: true, ...liveHit };
+            matchedKeywords = uniqueList([liveHit.matched_text, liveHit.keyword, keywords[0]]);
+            answerText = liveHit.answer_text || answerText;
+            runDebug.push({
+              round: followupCount,
+              type: "pre_send_keyword_hit",
+              cancelled_followup: followup.prompt,
+              matched_text: liveHit.matched_text,
+              source: liveHit.source,
+            });
+            domLocation = await locateAndMarkKeywordForScreenshot(
+              task.platform,
+              answerText,
+              matchedKeywords,
+              judgeResult,
+              keywords
+            );
+            break;
           }
 
           const prompt = followup.prompt;
           followupCount += 1;
           previousText = getAnswerText(task.platform);
+          assertActiveRun();
           await sendPrompt(task.platform, prompt);
           conversation.push({ role: "user", content: prompt });
           lastPrompt = prompt;
           answerText = await waitAnswerStable(task, previousText);
+          assertActiveRun();
           conversation.push({ role: "assistant", content: answerText });
 
           const prepared = await judgeAndPrepareFollowup(answerText, keywords, task, lastPrompt, followupCount, conversation);
@@ -399,6 +519,7 @@
           }
         }
 
+        assertActiveRun();
         const captured = await captureTaskScreenshot(task, matched, matchedKeywords, answerText, judgeResult, domLocation);
 
         return {
@@ -421,6 +542,57 @@
           answer_text: getAnswerText(task.platform),
           answer_debug: collectAnswerDebug(task.platform, "", GEO_LAST_ANSWER_ELEMENT, "error"),
           run_debug: [],
+          error: String(error && error.message ? error.message : error),
+        };
+      }
+    };
+  } catch (e) {}
+
+  try {
+    window.geoAutomationCollectTargetContext = async function geoAutomationCollectTargetContext(payload) {
+      const platform = String(payload && payload.platform ? payload.platform : "");
+      const keywords = Array.isArray(payload && payload.keywords)
+        ? payload.keywords.map((item) => String(item || "").trim()).filter(Boolean)
+        : [];
+      if (!platform || !keywords.length) {
+        return { ok: false, answer_text: "", error: "目标预搜索缺少平台或关键词" };
+      }
+
+      const primaryTarget = keywords[0];
+      const researchPrompt = [
+        `请客观介绍“${primaryTarget}”。`,
+        "重点说明所在地、所属品类、核心特色、口味或能力、历史传承、适用场景和购买或使用方式。",
+        "如果信息不确定请明确说明，不要虚构。",
+      ].join("");
+      const researchTask = {
+        platform,
+        keywords: [],
+        keyword: "",
+        answer_poll_interval: Number(payload.answer_poll_interval || 0.8),
+        answer_stable_seconds: Number(payload.answer_stable_seconds || 3),
+        answer_keyword_stable_seconds: 3,
+        answer_final_settle_seconds: Number(payload.answer_final_settle_seconds || 5),
+        answer_min_chars: 30,
+        answer_timeout_seconds: Number(payload.answer_timeout_seconds || 70),
+      };
+
+      try {
+        clearKeywordMarks();
+        clearMatchedBadges();
+        const previousText = getAnswerText(platform);
+        await sendPrompt(platform, researchPrompt);
+        const answerText = await waitAnswerStable(researchTask, previousText);
+        return {
+          ok: normalizeText(answerText).length >= 20,
+          answer_text: answerText,
+          prompt: researchPrompt,
+          answer_debug: GEO_LAST_ANSWER_DEBUG,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          answer_text: getAnswerText(platform),
+          prompt: researchPrompt,
           error: String(error && error.message ? error.message : error),
         };
       }

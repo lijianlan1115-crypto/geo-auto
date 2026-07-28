@@ -410,6 +410,51 @@ function firstVisible(selectors) {
   return null;
 }
 
+function findWenxinInput() {
+  const selectors = [
+    "#input-root textarea",
+    '#input-root [contenteditable="true"]',
+    '#input-root [contenteditable="plaintext-only"]',
+    "#chat-input-home textarea",
+    '#chat-input-home [contenteditable="true"]',
+    '#chat-input-home [contenteditable="plaintext-only"]',
+    ".ci-root textarea",
+    '.ci-root [contenteditable="true"]',
+    '.ci-root [contenteditable="plaintext-only"]',
+  ];
+  const seen = new Set();
+  const candidates = [];
+  for (const selector of selectors) {
+    for (const input of document.querySelectorAll(selector)) {
+      if (seen.has(input)) continue;
+      seen.add(input);
+      if (input.disabled || input.getAttribute("aria-disabled") === "true") continue;
+      const rect = input.getBoundingClientRect();
+      if (rect.width < 80 || rect.height < 20) continue;
+      let score = 0;
+      if (input.closest("#input-root")) score += 500;
+      if (input.closest(".ci-root")) score += 300;
+      if (input.isContentEditable) score += 180;
+      if (input instanceof HTMLTextAreaElement) score += 160;
+      score += Math.max(0, rect.top) / 10;
+      score += Math.min(rect.width, 1200) / 20;
+      candidates.push({ input, score });
+    }
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates.length ? candidates[0].input : null;
+}
+
+async function waitForWenxinInput(timeoutMs = 5000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const input = findWenxinInput();
+    if (input) return input;
+    await sleep(100);
+  }
+  return null;
+}
+
 function visibleElements(selectors) {
   const elements = [];
   for (const selector of selectors) {
@@ -480,6 +525,26 @@ async function setInputValue(input, text) {
     await sleep(60);
     nativeSetValue(input, text);
     dispatchTextInputEvents(input, null);
+  }
+}
+
+async function setWenxinInputValue(input, text) {
+  input.focus();
+  let inserted = false;
+  if (input.isContentEditable) {
+    try {
+      document.execCommand("selectAll", false, null);
+      inserted = document.execCommand("insertText", false, text);
+    } catch (e) {}
+  }
+  if (!inserted) {
+    await setInputValue(input, text);
+  } else {
+    dispatchTextInputEvents(input, text);
+  }
+  await sleep(150);
+  if (getInputText(input) !== String(text).trim()) {
+    await setInputValue(input, text);
   }
 }
 
@@ -649,44 +714,107 @@ function findSendButton(input, platform) {
 }
 
 function findWenxinSendButton(input) {
-  const inputRect = input.getBoundingClientRect();
-  // 在输入框周围找按钮：文心一言的发送按钮通常在右下角或输入框右侧
-  const candidates = Array.from(document.querySelectorAll('button, [role="button"], [class*="send"], [class*="Send"], [class*="submit"], [class*="Submit"]'))
+  const candidates = Array.from(document.querySelectorAll(".ci-submit-button"))
     .filter((btn) => {
       if (btn.disabled || btn.getAttribute("aria-disabled") === "true") return false;
       const rect = btn.getBoundingClientRect();
       if (rect.width <= 8 || rect.height <= 8) return false;
-      // 靠近输入框：在输入框下方 0-200px 或右侧 0-200px
-      const nearInputBottom = rect.top >= inputRect.bottom - 10 && rect.top <= inputRect.bottom + 200;
-      const nearInputRight = rect.left >= inputRect.left && rect.left <= inputRect.right + 200;
-      const text = (btn.innerText || btn.textContent || btn.getAttribute("aria-label") || "").trim();
+      const text = `${btn.innerText || ""} ${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""} ${btn.title || ""}`.trim();
       const classList = String(btn.className || "");
-      if (/Tool|Deep Thinking|更多|快速|PPT|图片|视频|录音|编程|代码|Code|code|快捷键|\+|清空|重置/.test(text)) return false;
-      if (text.includes("发送") || text.includes("Send") || text.includes("send") || classList.includes("send") || classList.includes("Send")) return true;
-      // 如果按钮有 SVG 图标且在输入框附近，也是候选
-      if (btn.querySelector("svg") && (nearInputBottom || nearInputRight)) return true;
-      return false;
+      const isKnownWenxinSend =
+        btn.matches(".ci-submit-button") &&
+        Boolean(btn.querySelector("#ci-submit-button-ai, img.ci-submit-button-ai-active"));
+      if (!isKnownWenxinSend) return false;
+      if (/推荐|猜你|换一换|相关问题|Tool|Deep Thinking|更多|快速|PPT|图片|视频|录音|编程|代码|Code|快捷键|\+|清空|重置/.test(text)) return false;
+      return true;
     })
     .map((btn) => {
-      const rect = btn.getBoundingClientRect();
       let score = 0;
-      const text = (btn.innerText || btn.textContent || btn.getAttribute("aria-label") || "").trim();
-      if (text.includes("发送")) score += 200;
-      if (text.includes("Send") || text.includes("send")) score += 180;
-      if (btn.querySelector("svg")) score += 100;
-      if (String(btn.className || "").includes("send") || String(btn.className || "").includes("Send")) score += 150;
-      // 离输入框越近分越高
-      const distFromBottom = Math.abs(rect.top - inputRect.bottom);
-      const distFromRight = Math.abs(rect.left - inputRect.right);
-      score -= Math.min(distFromBottom, distFromRight) / 5;
+      const text = `${btn.innerText || ""} ${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""} ${btn.title || ""}`.trim();
+      const classList = String(btn.className || "");
+      if (btn.matches(".ci-submit-button") && btn.querySelector("#ci-submit-button-ai")) score += 1000;
+      if (btn.querySelector("img.ci-submit-button-ai-active")) score += 500;
+      if (/发送/.test(text)) score += 300;
+      if (/Send/i.test(text)) score += 260;
+      if (btn.getAttribute("type") === "submit") score += 240;
+      if (/(^|[-_\s])(send|submit)([-_\s]|$)/i.test(classList)) score += 220;
+      if (input.closest("form") && input.closest("form").contains(btn)) score += 180;
       return { button: btn, score };
     })
     .sort((a, b) => b.score - a.score);
-  
+
   return candidates.length ? candidates[0].button : null;
 }
 
-async function clickSendButton(input, platform) {
+async function waitForWenxinSendButton(input, timeoutMs = 5000) {
+  const started = Date.now();
+  let exactButton = null;
+  while (Date.now() - started < timeoutMs) {
+    exactButton = findWenxinSendButton(input);
+    if (exactButton) {
+      const icon = exactButton.querySelector("#ci-submit-button-ai");
+      if (icon && icon.classList.contains("ci-submit-button-ai-active")) {
+        return exactButton;
+      }
+    }
+    await sleep(100);
+  }
+  return exactButton;
+}
+
+function clickWenxinExactSendButton(button) {
+  const clickTarget = button.querySelector("#ci-submit-button-ai") || button;
+  button.scrollIntoView({ block: "center", inline: "center" });
+  clickTarget.focus?.();
+  const eventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: window,
+    button: 0,
+    buttons: 1,
+  };
+  try {
+    clickTarget.dispatchEvent(new PointerEvent("pointerdown", { ...eventInit, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+  } catch (e) {}
+  clickTarget.dispatchEvent(new MouseEvent("mousedown", eventInit));
+  try {
+    clickTarget.dispatchEvent(new PointerEvent("pointerup", { ...eventInit, buttons: 0, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+  } catch (e) {}
+  clickTarget.dispatchEvent(new MouseEvent("mouseup", { ...eventInit, buttons: 0 }));
+  clickTarget.click();
+}
+
+async function waitForInputCleared(input, timeoutMs = 1800) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (!getInputText(input).trim()) return true;
+    await sleep(100);
+  }
+  return false;
+}
+
+async function waitForWenxinSendAccepted(input, previousAnswerText, timeoutMs = 3200) {
+  const started = Date.now();
+  const previousNormalized = normalizeKeywordText(previousAnswerText || "");
+  while (Date.now() - started < timeoutMs) {
+    if (!getInputText(input).trim()) return true;
+    if (pageIsAnswerGenerating("wenxin")) return true;
+    const currentAnswer = getAnswerText("wenxin");
+    const currentNormalized = normalizeKeywordText(currentAnswer || "");
+    if (
+      currentNormalized &&
+      currentNormalized !== previousNormalized &&
+      Math.abs(currentNormalized.length - previousNormalized.length) >= 8
+    ) {
+      return true;
+    }
+    await sleep(100);
+  }
+  return false;
+}
+
+async function clickSendButton(input, platform, previousAnswerText = "") {
   // 千问：优先用 Enter 发送（千问的 textarea 支持 Enter 发送）
   if (platform === "qianwen") {
     pressEnterToSend(input);
@@ -699,28 +827,29 @@ async function clickSendButton(input, platform) {
 
   // 文心一言：使用专门的按钮查找
   if (platform === "wenxin") {
-    const wenxinBtn = findWenxinSendButton(input);
-    if (wenxinBtn) {
-      wenxinBtn.scrollIntoView({ block: "center" });
-      await sleep(200);
-      wenxinBtn.click();
-      await sleep(400);
-      const textAfter = getInputText(input);
-      if (!textAfter || textAfter.length === 0) return true;
+    const wenxinBtn = await waitForWenxinSendButton(input);
+    if (!wenxinBtn) {
+      throw new Error("文心没有找到明确的发送按钮：已禁止点击普通 SVG、推荐问题及使用 Enter 兜底。");
+    }
+    wenxinBtn.scrollIntoView({ block: "center", inline: "center" });
+    await sleep(200);
+    const mainWorldClick = await Promise.race([
+      runtimeMessage({ action: "WENXIN_CLICK_SEND_MAIN" }).catch(() => null),
+      sleep(3000).then(() => ({ ok: false, error: "文心主页面点击等待超过3秒" })),
+    ]);
+    if (!mainWorldClick || !mainWorldClick.ok) {
+      clickWenxinExactSendButton(wenxinBtn);
+    }
+    if (await waitForWenxinSendAccepted(input, previousAnswerText)) {
       return true;
     }
-    // 找不到按钮时，尝试多次点击常见位置
-    // 部分文心版本用 contenteditable 输入框，尝试用 submitInputForm
-    if (await submitInputForm(input)) {
-      await sleep(500);
+    // 文心部分版本不响应脚本 click，但输入框支持 Enter 提交。
+    // 只尝试一次，绝不重复按键，避免连发两个问题。
+    pressEnterToSend(input);
+    if (await waitForWenxinSendAccepted(input, previousAnswerText, 3500)) {
       return true;
     }
-    // 最后尝试 Enter（部分 textarea 版本支持）
-    pressEnterToSend(input);
-    await sleep(300);
-    pressEnterToSend(input);
-    await sleep(500);
-    return true;
+    throw new Error("文心精确发送按钮和单次 Enter 均未成功；为避免重复发送，任务已停止。");
   }
 
   const sendButton = findSendButton(input, platform);
@@ -739,16 +868,38 @@ async function clickSendButton(input, platform) {
 
 async function sendPrompt(platform, text) {
   const rules = PLATFORM_RULES[platform] || PLATFORM_RULES.doubao;
+  const previousAnswerText = platform === "wenxin" ? getAnswerText(platform) : "";
   if (platform === "qianwen") {
     await clearQianwenActiveModes();
   }
-  let input = firstVisible(rules.input);
+  let input = platform === "wenxin"
+    ? await waitForWenxinInput()
+    : firstVisible(rules.input);
   if (!input) throw new Error("找不到输入框，请先确认平台页面已登录并处于聊天页");
 
   if (platform === "qianwen") {
     input = await ensureQianwenChatMode(input, text);
   }
-  await setInputValue(input, text);
+  if (platform === "wenxin") {
+    const mainWorldWrite = await Promise.race([
+      runtimeMessage({ action: "WENXIN_SET_INPUT_MAIN", text: String(text || "") }).catch((error) => ({
+        ok: false,
+        error: String(error && error.message ? error.message : error),
+      })),
+      sleep(3000).then(() => ({ ok: false, error: "文心主页面写入等待超过3秒" })),
+    ]);
+    if (!mainWorldWrite || !mainWorldWrite.ok) {
+      await setWenxinInputValue(input, text);
+    }
+    input = await waitForWenxinInput(2000);
+    if (!input || getInputText(input) !== String(text).trim()) {
+      throw new Error(
+        `文心追问没有精确写入输入框：${mainWorldWrite && mainWorldWrite.error ? mainWorldWrite.error : "写入后校验失败"}`
+      );
+    }
+  } else {
+    await setInputValue(input, text);
+  }
   await sleep(500);
 
   if (platform === "qianwen") {
@@ -763,7 +914,7 @@ async function sendPrompt(platform, text) {
     }
   }
 
-  await clickSendButton(input, platform);
+  await clickSendButton(input, platform, previousAnswerText);
   await sleep(800);
   return true;
 }
@@ -1242,7 +1393,9 @@ function isIgnoredLocateNode(node) {
     node.closest(
       [
         "#geo-auto-root",
+        ".geo-matched-badge",
         ".geo-keyword-mark",
+        "[data-geo-overlay='1']",
         "script",
         "style",
         "noscript",
@@ -1608,6 +1761,7 @@ function drawMatchedBadge(matchedKeywords) {
 
   const badge = document.createElement("div");
   badge.className = "geo-matched-badge";
+  badge.dataset.geoOverlay = "1";
   badge.textContent = `命中：${matchedKeywords.join("、")}`;
   Object.assign(badge.style, {
     position: "fixed",
@@ -1835,6 +1989,15 @@ async function findKeywordWithNativeFind(searchTerms, preferredRoot = null) {
 function qianwenKeywordNodeScore(node, term) {
   if (!node || isIgnoredLocateNode(node)) return null;
   if (node.querySelector && node.querySelector("textarea, input, [contenteditable='true']")) return null;
+
+  // 千问定位只能命中回答正文。插件自身的固定提示层（例如右上角“命中”徽标）
+  // 也包含目标词，若不排除会被误判成答案中的第一个命中位置。
+  let positionedAncestor = node;
+  while (positionedAncestor && positionedAncestor !== document.body) {
+    const positionedStyle = window.getComputedStyle(positionedAncestor);
+    if (positionedStyle.position === "fixed" || positionedStyle.position === "sticky") return null;
+    positionedAncestor = positionedAncestor.parentElement;
+  }
 
   const text = node.innerText || node.textContent || "";
   const normalized = normalizeKeywordText(text);

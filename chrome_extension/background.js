@@ -1,5 +1,6 @@
 let running = false;
 let activeCount = 0;
+let pumpActive = false;
 let currentServerUrl = "http://127.0.0.1:8765";
 let currentConcurrency = 3;
 
@@ -81,6 +82,7 @@ async function effectiveTaskKeywords(task) {
 async function runOneTask(task) {
   let win = null;
   let tab = null;
+  let keepWindowOpen = false;
   try {
     const data = await chrome.storage.local.get(["platformUrls"]);
     const customUrl = data.platformUrls && data.platformUrls[task.platform];
@@ -128,6 +130,12 @@ async function runOneTask(task) {
     if (!result) {
       throw new Error("content script did not return result");
     }
+    if (
+      task.platform === "wenxin" &&
+      /文心.*(?:发送按钮|输入框未清空|避免重复发送)/.test(String(result.error || ""))
+    ) {
+      keepWindowOpen = true;
+    }
 
     if (!result.screenshot_data_url && tab && tab.windowId) {
       result.screenshot_data_url = await captureTabScreenshot(tab.windowId);
@@ -159,6 +167,12 @@ async function runOneTask(task) {
       }),
     });
   } catch (error) {
+    if (
+      task.platform === "wenxin" &&
+      /文心.*(?:发送按钮|输入框未清空|避免重复发送)/.test(String(error && error.message ? error.message : error))
+    ) {
+      keepWindowOpen = true;
+    }
     let fallbackSubmitted = false;
     if (tab && tab.windowId) {
       const fallbackScreenshot = await captureTabScreenshot(tab.windowId).catch(() => null);
@@ -196,20 +210,22 @@ async function runOneTask(task) {
       }),
     }).catch(() => {});
   } finally {
-    activeCount -= 1;
-    if (win && win.id) {
+    activeCount = Math.max(0, activeCount - 1);
+    if (win && win.id && !keepWindowOpen) {
       await chrome.windows.remove(win.id).catch(() => {});
     }
-    pump();
   }
 }
 
 async function captureTabScreenshot(windowId) {
-  try {
-    return await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
-  } catch (e) {
-    return null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const screenshot = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+      if (screenshot) return screenshot;
+    } catch (e) {}
+    await sleep(250);
   }
+  return null;
 }
 
 async function testScreenshot(keywordText) {
@@ -284,23 +300,135 @@ async function getEffectiveConcurrency() {
   return Math.max(1, Math.min(5, Number(data.concurrency || currentConcurrency)));
 }
 
-async function pump() {
-  if (!running) return;
-  while (running) {
-    const effectiveConcurrency = await getEffectiveConcurrency();
-    if (activeCount >= effectiveConcurrency) {
-      await sleep(1000);
-      continue;
+async function collectOneTargetPlatformContext(platform, keywords) {
+  let win = null;
+  let tab = null;
+  try {
+    win = await createTaskWindow(platform.url);
+    if (!win || !win.id || !win.tabs || !win.tabs.length) {
+      throw new Error("无法创建目标预搜索窗口");
     }
+    tab = win.tabs[0];
+    await waitForTabLoaded(tab.id);
+    await sleep(2200);
+    await injectAutomationScripts(tab.id);
+    const scriptResult = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: async (payload) => {
+        if (typeof window.geoAutomationCollectTargetContext !== "function") {
+          return { ok: false, answer_text: "", error: "目标预搜索脚本未加载" };
+        }
+        return await window.geoAutomationCollectTargetContext(payload);
+      },
+      args: [{
+        platform: platform.key,
+        keywords,
+        answer_poll_interval: 0.8,
+        answer_stable_seconds: 3,
+        answer_final_settle_seconds: 5,
+        answer_timeout_seconds: 70,
+      }],
+    });
+    const result = scriptResult && scriptResult[0] ? scriptResult[0].result : null;
+    await api("/target-platform-context", {
+      method: "POST",
+      body: JSON.stringify({
+        keywords,
+        platform: platform.key,
+        ok: Boolean(result && result.ok),
+        answer_text: result && result.answer_text ? result.answer_text : "",
+        error: result && result.error ? result.error : "目标预搜索没有返回结果",
+      }),
+    });
+    return {
+      platform: platform.key,
+      ok: Boolean(result && result.ok),
+      error: result && result.error ? result.error : "",
+    };
+  } catch (error) {
+    await api("/target-platform-context", {
+      method: "POST",
+      body: JSON.stringify({
+        keywords,
+        platform: platform.key,
+        ok: false,
+        answer_text: "",
+        error: String(error && error.message ? error.message : error),
+      }),
+    }).catch(() => {});
+    return {
+      platform: platform.key,
+      ok: false,
+      error: String(error && error.message ? error.message : error),
+    };
+  } finally {
+    if (win && win.id) await chrome.windows.remove(win.id).catch(() => {});
+  }
+}
 
-    const data = await api("/next-task");
-    if (!data.ok || !data.task) {
-      running = false;
-      return;
+async function prewarmTargetContexts(platforms) {
+  const response = await api("/target-keyword-groups");
+  const groups = response && response.ok && Array.isArray(response.groups) ? response.groups : [];
+  const availablePlatforms = (platforms || []).filter((item) => item && item.key && item.url);
+  const results = [];
+
+  // Different target groups run one after another to avoid opening too many
+  // windows, while Doubao/Yuanbao/Qianwen for the same target run in parallel.
+  for (const group of groups) {
+    if (!running) break;
+    const keywords = Array.isArray(group.keywords) ? group.keywords.filter(Boolean) : [];
+    const cached = new Set(Array.isArray(group.cached_platforms) ? group.cached_platforms : []);
+    if (!keywords.length) continue;
+    const jobs = availablePlatforms
+      .filter((platform) => !cached.has(platform.key))
+      .map((platform) => collectOneTargetPlatformContext(platform, keywords));
+    if (jobs.length) results.push(...await Promise.all(jobs));
+  }
+
+  return {
+    groups: groups.length,
+    attempted: results.length,
+    succeeded: results.filter((item) => item.ok).length,
+    failed: results.filter((item) => !item.ok).length,
+  };
+}
+
+async function pump() {
+  if (!running || pumpActive) return;
+  pumpActive = true;
+  try {
+    while (running) {
+      const effectiveConcurrency = await getEffectiveConcurrency();
+      if (activeCount >= effectiveConcurrency) {
+        await sleep(100);
+        continue;
+      }
+
+      const data = await api("/next-task");
+      if (!data.ok) {
+        running = false;
+        return;
+      }
+      if (!data.task) {
+        if (activeCount > 0) {
+          await sleep(100);
+          continue;
+        }
+        // All windows have finished. Persist the final workbook first, then let
+        // the service clear this batch's temporary SQLite task records.
+        await api("/finalize-batch", {
+          method: "POST",
+          body: JSON.stringify({}),
+        }).catch(() => {});
+        running = false;
+        return;
+      }
+      activeCount += 1;
+      void runOneTask(data.task);
+      await sleep(50);
     }
-    activeCount += 1;
-    runOneTask(data.task);
-    await sleep(1000);
+  } finally {
+    pumpActive = false;
   }
 }
 
@@ -353,6 +481,135 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
+    if (message.action === "WENXIN_CLICK_SEND_MAIN") {
+      if (!sender.tab || !sender.tab.id) {
+        sendResponse({ ok: false, error: "找不到文心标签页" });
+        return;
+      }
+      try {
+        const [{ result }] = await chrome.scripting.executeScript({
+          target: { tabId: sender.tab.id },
+          world: "MAIN",
+          func: () => {
+          const wrapper = Array.from(document.querySelectorAll(".ci-submit-button")).find((node) => {
+            const rect = node.getBoundingClientRect();
+            return rect.width > 8 && rect.height > 8 && node.querySelector("#ci-submit-button-ai");
+          });
+          if (!wrapper) return { ok: false, error: "主页面未找到 .ci-submit-button" };
+          const target = wrapper.querySelector("#ci-submit-button-ai") || wrapper;
+          target.focus?.();
+          const init = { bubbles: true, cancelable: true, composed: true, view: window, button: 0, buttons: 1 };
+          try {
+            target.dispatchEvent(new PointerEvent("pointerdown", { ...init, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+          } catch (e) {}
+          target.dispatchEvent(new MouseEvent("mousedown", init));
+          try {
+            target.dispatchEvent(new PointerEvent("pointerup", { ...init, buttons: 0, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+          } catch (e) {}
+          target.dispatchEvent(new MouseEvent("mouseup", { ...init, buttons: 0 }));
+          target.click();
+          return {
+            ok: true,
+            active: target.classList.contains("ci-submit-button-ai-active"),
+            target: target.id || target.className || target.tagName,
+          };
+          },
+        });
+        sendResponse(result || { ok: false, error: "文心主页面点击没有返回结果" });
+      } catch (error) {
+        sendResponse({ ok: false, error: String(error && error.message ? error.message : error) });
+      }
+      return;
+    }
+
+    if (message.action === "WENXIN_SET_INPUT_MAIN") {
+      if (!sender.tab || !sender.tab.id) {
+        sendResponse({ ok: false, error: "找不到文心标签页" });
+        return;
+      }
+      try {
+        const [{ result }] = await chrome.scripting.executeScript({
+          target: { tabId: sender.tab.id },
+          world: "MAIN",
+          args: [String(message.text || "")],
+          func: async (text) => {
+            const selectors = [
+              "#input-root textarea",
+              '#input-root [contenteditable="true"]',
+              '#input-root [contenteditable="plaintext-only"]',
+              "#chat-input-home textarea",
+              '#chat-input-home [contenteditable="true"]',
+              '#chat-input-home [contenteditable="plaintext-only"]',
+              ".ci-root textarea",
+              '.ci-root [contenteditable="true"]',
+              '.ci-root [contenteditable="plaintext-only"]',
+            ];
+            const candidates = [];
+            const seen = new Set();
+            for (const selector of selectors) {
+              for (const node of document.querySelectorAll(selector)) {
+                if (seen.has(node)) continue;
+                seen.add(node);
+                const rect = node.getBoundingClientRect();
+                if (rect.width < 80 || rect.height < 20 || node.disabled || node.getAttribute("aria-disabled") === "true") continue;
+                let score = rect.top + Math.min(rect.width, 1200);
+                if (node.closest("#input-root")) score += 5000;
+                if (node.closest(".ci-root")) score += 3000;
+                candidates.push({ node, score });
+              }
+            }
+            candidates.sort((a, b) => b.score - a.score);
+            const input = candidates[0] && candidates[0].node;
+            if (!input) return { ok: false, error: "主页面未找到 #input-root 内的真实编辑框" };
+
+            input.focus();
+            if (input.isContentEditable) {
+              const selection = window.getSelection();
+              const range = document.createRange();
+              range.selectNodeContents(input);
+              selection.removeAllRanges();
+              selection.addRange(range);
+              let inserted = false;
+              try {
+                inserted = document.execCommand("insertText", false, text);
+              } catch (e) {}
+              if (!inserted || String(input.textContent || "").trim() !== text.trim()) {
+                input.textContent = text;
+              }
+            } else {
+              const proto = input instanceof HTMLTextAreaElement
+                ? HTMLTextAreaElement.prototype
+                : HTMLInputElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+              if (setter) setter.call(input, text);
+              else input.value = text;
+            }
+            input.dispatchEvent(new InputEvent("input", {
+              bubbles: true,
+              composed: true,
+              inputType: "insertText",
+              data: text,
+            }));
+            input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+            await new Promise((resolve) => setTimeout(resolve, 180));
+            const actual = String(input.isContentEditable ? input.textContent : input.value || "").trim();
+            return {
+              ok: actual === text.trim(),
+              error: actual === text.trim() ? "" : "写入后文本校验不一致",
+              actual_length: actual.length,
+              expected_length: text.trim().length,
+              tag: input.tagName,
+              class_name: String(input.className || ""),
+            };
+          },
+        });
+        sendResponse(result || { ok: false, error: "文心主页面写入没有返回结果" });
+      } catch (error) {
+        sendResponse({ ok: false, error: String(error && error.message ? error.message : error) });
+      }
+      return;
+    }
+
     if (message.action === "JUDGE_ANSWER") {
       sendResponse(await api("/judge-answer", {
         method: "POST",
@@ -375,6 +632,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           question: message.question || "",
           platform: message.platform || "",
           followup_count: message.followup_count || 0,
+          task_id: message.task_id || (message.question && message.question.task_id) || "",
         }),
       }));
       return;
@@ -480,14 +738,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
       running = true;
+      const targetWarmup = await prewarmTargetContexts(message.platforms || []).catch((error) => ({
+        groups: 0,
+        attempted: 0,
+        succeeded: 0,
+        failed: 0,
+        error: String(error && error.message ? error.message : error),
+      }));
+      if (!running) {
+        sendResponse({ ok: true, running: false, message: "已停止；目标预搜索结果已保留供下次继续。", target_warmup: targetWarmup });
+        return;
+      }
       pump();
       const stats = health && health.stats ? health.stats : {};
       sendResponse({
         ok: true,
         running,
         concurrency: currentConcurrency,
-        message: `已开始 / 继续执行：已完成 ${Number(stats.done || 0)}，待执行 ${Number(stats.pending || 0)}，失败 ${Number(stats.failed || 0)}。`,
+        message: `目标预搜索完成（成功 ${Number(targetWarmup.succeeded || 0)}/${Number(targetWarmup.attempted || 0)}），已开始执行：已完成 ${Number(stats.done || 0)}，待执行 ${Number(stats.pending || 0)}，失败 ${Number(stats.failed || 0)}。`,
         stats,
+        target_warmup: targetWarmup,
       });
       return;
     }
