@@ -64,6 +64,8 @@ except ImportError as exc:
 # serialized, including recovery paths that call another lock-aware helper.
 lock = threading.RLock()
 TARGET_PLATFORM_CONTEXT_PATH = OUTPUT_DIR / "target_platform_context_cache.json"
+LAST_SYNC_ERROR = ""
+LAST_SYNC_WARNING = ""
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -427,20 +429,14 @@ def configure_platforms(platforms):
             f"delete from tasks where platform not in ({placeholders})",
             tuple(new_platforms.keys()),
         )
-    # 结果表必须以插件当前渠道为准。平台配置成功后先建列、恢复已有截图，
-    # 完成后插件才可以开始领取任务。
-    if not sync_result_from_db():
-        return {
-            "ok": False,
-            "error": "无法生成渠道列或嵌入已有图片。请关闭 Excel/WPS 后重新点击开始。",
-            "platforms": runtime_platforms(),
-            "stats": stats(),
-        }
+    # 保存插件渠道配置不能依赖 Excel 是否可写。渠道列生成和历史图片恢复
+    # 在点击“开始”时由 /sync-results 单独执行并返回具体错误。
     return {
         "ok": True,
         "platforms": runtime_platforms(),
         "stats": stats(),
         "result_excel": str(RESULT_EXCEL),
+        "excel_synced": False,
     }
 
 
@@ -483,7 +479,20 @@ def prepare_workbook(clear_outputs=False):
     if not RESULT_EXCEL.exists():
         shutil.copy2(INPUT_EXCEL, RESULT_EXCEL)
 
-    wb = load_workbook(RESULT_EXCEL)
+    try:
+        wb = load_workbook(RESULT_EXCEL)
+    except PermissionError:
+        raise
+    except Exception as exc:
+        # 旧版本或 WPS 可能留下结构异常的空结果表。保留原文件为可恢复备份，
+        # 重新从输入表创建结果，然后由 SQLite + screenshots 补回已完成内容。
+        broken_backup = RESULT_EXCEL.with_name(
+            f".{RESULT_EXCEL.name}.{int(time.time())}.unreadable-backup"
+        )
+        os.replace(RESULT_EXCEL, broken_backup)
+        shutil.copy2(INPUT_EXCEL, RESULT_EXCEL)
+        print(f"旧结果表无法读取，已保留备份并重建：{broken_backup}；原因：{exc}")
+        wb = load_workbook(RESULT_EXCEL)
     ws = find_question_worksheet(wb)
     wb.active = wb.worksheets.index(ws)
     headers = read_headers(ws)
@@ -1040,29 +1049,33 @@ def write_temp_answer_sheet(payload):
 def add_screenshot_to_worksheet(ws, screenshot_path, row_number, image_col):
     if not screenshot_path or not Path(screenshot_path).exists():
         return False
-    image_cell = f"{col_letter(ws, image_col)}{row_number}"
-    remove_images_at_cell(ws, image_cell)
-    img = ExcelImage(str(screenshot_path))
-    original_width = max(1, int(getattr(img, "width", 1) or 1))
-    original_height = max(1, int(getattr(img, "height", 1) or 1))
-    max_width = 520
-    max_height = 330
-    scale = min(max_width / original_width, max_height / original_height, 1.0)
-    if original_width > max_width or original_height > max_height:
-        img.width = int(original_width * scale)
-        img.height = int(original_height * scale)
+    try:
+        image_cell = f"{col_letter(ws, image_col)}{row_number}"
+        remove_images_at_cell(ws, image_cell)
+        img = ExcelImage(str(screenshot_path))
+        original_width = max(1, int(getattr(img, "width", 1) or 1))
+        original_height = max(1, int(getattr(img, "height", 1) or 1))
+        max_width = 520
+        max_height = 330
+        scale = min(max_width / original_width, max_height / original_height, 1.0)
+        if original_width > max_width or original_height > max_height:
+            img.width = int(original_width * scale)
+            img.height = int(original_height * scale)
 
-    ws.row_dimensions[row_number].height = max(
-        ws.row_dimensions[row_number].height or 0,
-        int(img.height * 0.75) + 12,
-    )
-    ws.column_dimensions[col_letter(ws, image_col)].width = max(
-        ws.column_dimensions[col_letter(ws, image_col)].width or 0,
-        min(76, max(38, img.width / 7)),
-    )
-    anchor_image_inside_cell(img, row_number, image_col)
-    ws.add_image(img)
-    return True
+        ws.row_dimensions[row_number].height = max(
+            ws.row_dimensions[row_number].height or 0,
+            int(img.height * 0.75) + 12,
+        )
+        ws.column_dimensions[col_letter(ws, image_col)].width = max(
+            ws.column_dimensions[col_letter(ws, image_col)].width or 0,
+            min(76, max(38, img.width / 7)),
+        )
+        anchor_image_inside_cell(img, row_number, image_col)
+        ws.add_image(img)
+        return True
+    except Exception as exc:
+        print(f"截图无法嵌入 Excel：{screenshot_path}；原因：{exc}")
+        return False
 
 
 def resolve_result_row(ws, headers, result):
@@ -1121,20 +1134,25 @@ def write_result_to_excel(result, screenshot_path):
         ws.cell(row=row_number, column=status_col, value=status_text)
         ws.cell(row=row_number, column=followup_col, value=int(result.get("followup_count", 0)))
 
-        add_screenshot_to_worksheet(ws, screenshot_path, row_number, image_col)
+        if not add_screenshot_to_worksheet(ws, screenshot_path, row_number, image_col):
+            raise RuntimeError(f"截图无法嵌入 Excel：{screenshot_path}")
 
         save_workbook_atomic(wb, RESULT_EXCEL)
 
 
 def sync_result_from_db():
     """将 SQLite 中已完成的状态补写到结果表；导出失败不影响任务状态。"""
+    global LAST_SYNC_ERROR, LAST_SYNC_WARNING
+    LAST_SYNC_ERROR = ""
+    LAST_SYNC_WARNING = ""
     try:
         with lock:
             prepare_workbook()
             with connect_db() as conn:
                 rows = conn.execute(
                     """
-                    select row_number, question, platform, status, matched, followup_count, screenshot_path, error
+                    select task_id, row_number, question, platform, status, matched,
+                           followup_count, screenshot_path, error
                     from tasks
                     where status in ('done', 'failed')
                     """
@@ -1144,6 +1162,7 @@ def sync_result_from_db():
             ws = find_question_worksheet(wb)
             wb.active = wb.worksheets.index(ws)
             headers = ensure_output_columns(ws)
+            image_failures = []
             for task in rows:
                 platform = PLATFORMS.get(task["platform"])
                 if not platform:
@@ -1160,16 +1179,42 @@ def sync_result_from_db():
                 row_number = resolve_result_row(ws, headers, dict(task))
                 ws.cell(row=row_number, column=status_col, value=status_text)
                 ws.cell(row=row_number, column=followup_col, value=int(task["followup_count"] or 0))
-                add_screenshot_to_worksheet(
+                image_inserted = add_screenshot_to_worksheet(
                     ws,
                     task["screenshot_path"],
                     row_number,
                     image_col,
                 )
+                if not image_inserted:
+                    image_failures.append(task["task_id"])
+                    ws.cell(
+                        row=row_number,
+                        column=status_col,
+                        value="失败：历史截图缺失或损坏，请重置失败任务",
+                    )
             save_workbook_atomic(wb, RESULT_EXCEL)
+
+            if image_failures:
+                with connect_db() as conn:
+                    placeholders = ",".join("?" for _ in image_failures)
+                    conn.execute(
+                        f"""
+                        update tasks
+                        set status = 'failed',
+                            error = '历史截图缺失或损坏，请重置失败任务',
+                            updated_at = ?
+                        where task_id in ({placeholders})
+                        """,
+                        (now(), *image_failures),
+                    )
+                LAST_SYNC_WARNING = (
+                    f"渠道列和可用图片已保存；另有 {len(image_failures)} 张历史截图缺失或损坏，"
+                    "已标记为失败，可在插件中重置失败任务后重新截图。"
+                )
         return True
     except Exception as exc:
-        print(f"结果表同步暂缓（任务状态已保存在 SQLite）：{exc}")
+        LAST_SYNC_ERROR = f"{type(exc).__name__}: {exc}"
+        print(f"结果表同步暂缓（任务状态已保存在 SQLite）：{LAST_SYNC_ERROR}")
         return False
 
 
@@ -1179,7 +1224,8 @@ def sync_results_api():
         "ok": synced,
         "synced": synced,
         "result_excel": str(RESULT_EXCEL),
-        "error": "" if synced else "Excel 写入失败。请关闭 Excel/WPS 后重试。",
+        "warning": LAST_SYNC_WARNING if synced else "",
+        "error": "" if synced else (LAST_SYNC_ERROR or "Excel 写入失败，详细原因未知"),
     }
 
 

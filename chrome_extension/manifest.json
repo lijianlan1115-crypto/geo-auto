@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GEO反馈自动化助手",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "控制AI平台提问、追问、截图，并把结果交给Python本地服务写回Excel。",
   "permissions": [
     "tabs",

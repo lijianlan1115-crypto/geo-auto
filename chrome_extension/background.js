@@ -720,6 +720,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
         return;
       }
+      const excelSync = await api("/sync-results", {
+        method: "POST",
+        body: JSON.stringify({ reason: "before_start" }),
+      }).catch((error) => ({
+        ok: false,
+        error: String(error && error.message ? error.message : error),
+      }));
+      if (!excelSync || !excelSync.ok) {
+        sendResponse({
+          ok: false,
+          running: false,
+          message: `插件配置已保存，但结果 Excel 准备失败：${excelSync && excelSync.error ? excelSync.error : "未知错误"}`,
+        });
+        return;
+      }
       await api("/reset-running-tasks", { method: "POST", body: JSON.stringify({}) }).catch(() => {});
       const health = await api("/health").catch(() => null);
       if (!health || !health.ok) {
