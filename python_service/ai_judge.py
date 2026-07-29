@@ -88,7 +88,43 @@ def keyword_aliases(keyword):
         aliases.add("贵州" + raw[2:])
     if raw.startswith("贵州"):
         aliases.add("贵阳" + raw[2:])
+    if "杨家" in raw:
+        aliases.add(raw.replace("杨家", "杨记"))
+    if "杨记" in raw:
+        aliases.add(raw.replace("杨记", "杨家"))
     return [item for item in aliases if item]
+
+
+def keyword_chars_equivalent(left, right):
+    return left == right or {left, right} == {"家", "记"}
+
+
+def find_loose_keyword_span(text, keyword):
+    haystack = normalize_text(text)
+    needle = normalize_text(keyword)
+    if not haystack or not needle:
+        return None
+    exact_index = haystack.find(needle)
+    if exact_index >= 0:
+        return exact_index, exact_index + len(needle), True
+    if len(needle) < 5:
+        return None
+
+    max_extra = max(4, int(len(needle) * 0.6))
+    for start in range(len(haystack)):
+        if not keyword_chars_equivalent(haystack[start], needle[0]):
+            continue
+        text_index = start
+        keyword_index = 0
+        while text_index < len(haystack) and keyword_index < len(needle):
+            if keyword_chars_equivalent(haystack[text_index], needle[keyword_index]):
+                keyword_index += 1
+            text_index += 1
+            if text_index - start > len(needle) + max_extra:
+                break
+        if keyword_index == len(needle):
+            return start, text_index, False
+    return None
 
 
 def paragraph_for_index(text, index):
@@ -100,7 +136,7 @@ def paragraph_for_index(text, index):
 
 def best_paragraph_by_alias(text, normalized_alias):
     for paragraph in split_paragraphs(text):
-        if normalized_alias in normalize_text(paragraph):
+        if find_loose_keyword_span(paragraph, normalized_alias):
             return paragraph[:260]
     return ""
 
@@ -113,10 +149,18 @@ def find_evidence(answer_text, keyword):
         if index >= 0:
             return {"matched": True, "keyword": keyword, "matched_text": alias, "evidence": paragraph_for_index(text, index), "match_type": "exact", "confidence": 1.0}
         normalized_alias = normalize_text(alias)
-        normalized_index = normalized_text.find(normalized_alias) if normalized_alias else -1
-        if normalized_index >= 0:
+        span = find_loose_keyword_span(normalized_text, normalized_alias)
+        if span:
             evidence = best_paragraph_by_alias(text, normalized_alias) or text[:200]
-            return {"matched": True, "keyword": keyword, "matched_text": alias, "evidence": evidence, "match_type": "normalized", "confidence": 0.98}
+            matched_text = normalized_text[span[0]:span[1]] or alias
+            return {
+                "matched": True,
+                "keyword": keyword,
+                "matched_text": matched_text,
+                "evidence": evidence,
+                "match_type": "normalized" if span[2] else "ordered_fuzzy",
+                "confidence": 0.98 if span[2] else 0.94,
+            }
     return None
 
 

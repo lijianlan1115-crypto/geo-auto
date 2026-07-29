@@ -1321,16 +1321,46 @@ function normalizeKeywordText(text) {
     .replace(/[，。！？、,.!?]/g, "");
 }
 
+function keywordCharsEquivalent(left, right) {
+  if (left === right) return true;
+  // 餐饮品牌中“某家/某记”经常是平台回答中的写法差异。
+  return (left === "家" && right === "记") || (left === "记" && right === "家");
+}
+
+function findLooseKeywordSpan(text, keyword) {
+  const haystack = normalizeKeywordText(text);
+  const needle = normalizeKeywordText(keyword);
+  if (!needle || !haystack) return null;
+
+  const exactIndex = haystack.indexOf(needle);
+  if (exactIndex >= 0) {
+    return { start: exactIndex, end: exactIndex + needle.length, exact: true };
+  }
+  // 短词做模糊匹配容易误判；至少 5 个有效字符才允许正文插入修饰词。
+  if (needle.length < 5) return null;
+
+  const maxExtra = Math.max(4, Math.floor(needle.length * 0.6));
+  for (let start = 0; start < haystack.length; start++) {
+    if (!keywordCharsEquivalent(haystack[start], needle[0])) continue;
+    let textIndex = start;
+    let keywordIndex = 0;
+    while (textIndex < haystack.length && keywordIndex < needle.length) {
+      if (keywordCharsEquivalent(haystack[textIndex], needle[keywordIndex])) keywordIndex++;
+      textIndex++;
+      if (textIndex - start > needle.length + maxExtra) break;
+    }
+    if (keywordIndex === needle.length) {
+      return { start, end: textIndex, exact: false };
+    }
+  }
+  return null;
+}
+
 function containsAnyTargetKeyword(text, keywords) {
-  const normalized = normalizeKeywordText(text || "");
-  if (!normalized) return false;
   const aliases = typeof keywordAliasesForPrompt === "function"
     ? keywordAliasesForPrompt(keywords)
     : splitKeywords(keywords);
-  return aliases.some((keyword) => {
-    const term = normalizeKeywordText(keyword);
-    return term && normalized.includes(term);
-  });
+  return aliases.some((keyword) => Boolean(findLooseKeywordSpan(text, keyword)));
 }
 
 function getKeywordContext(text, start, length, size = 15) {
@@ -1342,14 +1372,16 @@ function getKeywordContext(text, start, length, size = 15) {
 function getAnswerKeywordHit(answerText, keywords, judgeResult = null) {
   const text = String(answerText || "");
   for (const keyword of splitKeywords(keywords)) {
-    const index = text.indexOf(keyword);
-    if (index >= 0) {
+    const span = findLooseKeywordSpan(text, keyword);
+    if (span) {
+      const index = span.start;
       const prefixStart = Math.max(0, index - 15);
       return {
         keyword,
         index,
         prefix15: text.slice(prefixStart, index),
-        context: getKeywordContext(text, index, keyword.length, 15),
+        context: getKeywordContext(text, index, Math.max(keyword.length, span.end - span.start), 15),
+        match_type: span.exact ? "exact" : "ordered_fuzzy",
       };
     }
   }
@@ -1510,7 +1542,7 @@ function findKeywordRangesInDOM(root, keyword) {
   // 千问会把一个词拆进多个 span/text node。逐节点搜索无法命中这种正文，
   // 因此在快速路径失败后，建立跨文本节点的字符坐标并生成一个跨节点 Range。
   const rootText = normalizeKeywordText(root.textContent || "");
-  if (!keywordNormalized || !rootText.includes(keywordNormalized)) return results;
+  if (!keywordNormalized || !findLooseKeywordSpan(rootText, keywordNormalized)) return results;
 
   const crossWalker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
   const normalizedChars = [];
@@ -1528,10 +1560,14 @@ function findKeywordRangesInDOM(root, keyword) {
   }
 
   const flattened = normalizedChars.join("");
-  let crossIndex = flattened.indexOf(keywordNormalized);
-  while (crossIndex >= 0) {
-    const start = positions[crossIndex];
-    const end = positions[crossIndex + keywordNormalized.length - 1];
+  let searchFrom = 0;
+  while (searchFrom < flattened.length) {
+    const span = findLooseKeywordSpan(flattened.slice(searchFrom), keywordNormalized);
+    if (!span) break;
+    const spanStart = searchFrom + span.start;
+    const spanEnd = searchFrom + span.end;
+    const start = positions[spanStart];
+    const end = positions[spanEnd - 1];
     if (start && end) {
       const range = document.createRange();
       range.setStart(start.node, start.offset);
@@ -1540,11 +1576,12 @@ function findKeywordRangesInDOM(root, keyword) {
         range,
         node: start.node,
         keyword,
-        context: getKeywordContext(root.textContent || "", Math.max(0, crossIndex), keyword.length),
-        source: "cross_node_text",
+        matched_text: flattened.slice(spanStart, spanEnd),
+        context: getKeywordContext(root.textContent || "", Math.max(0, spanStart), keyword.length),
+        source: span.exact ? "cross_node_text" : "cross_node_fuzzy_text",
       });
     }
-    crossIndex = flattened.indexOf(keywordNormalized, crossIndex + keywordNormalized.length);
+    searchFrom = Math.max(spanStart + 1, spanEnd);
   }
 
   return results;
@@ -2047,7 +2084,7 @@ function qianwenKeywordNodeScore(node, term) {
   const text = node.innerText || node.textContent || "";
   const normalized = normalizeKeywordText(text);
   const normalizedTerm = normalizeKeywordText(term);
-  if (!normalizedTerm || !normalized.includes(normalizedTerm)) return null;
+  if (!normalizedTerm || !findLooseKeywordSpan(normalized, normalizedTerm)) return null;
 
   const rect = node.getBoundingClientRect();
   if (!rect.width || !rect.height) return null;
@@ -2531,6 +2568,8 @@ function keywordAliasesForPrompt(keywords) {
     aliases.add(keyword);
     if (keyword.startsWith("贵阳")) aliases.add(`贵州${keyword.slice(2)}`);
     if (keyword.startsWith("贵州")) aliases.add(`贵阳${keyword.slice(2)}`);
+    if (keyword.includes("杨家")) aliases.add(keyword.replace("杨家", "杨记"));
+    if (keyword.includes("杨记")) aliases.add(keyword.replace("杨记", "杨家"));
     if (/商学院/.test(keyword)) {
       aliases.add("贵商");
       aliases.add(keyword.replace("商学院", "商院"));
@@ -2632,21 +2671,22 @@ async function judgeAnswer(answerText, keywords, task) {
     const aliases = typeof keywordAliasesForPrompt === "function"
       ? keywordAliasesForPrompt([keyword])
       : [keyword];
-    const matchedAlias = aliases.find((alias) => {
-      const normalizedAlias = normalizeKeywordText(alias);
-      return normalizedAlias && normalizedAnswer.includes(normalizedAlias);
-    });
-    if (matchedAlias) {
+    const matched = aliases
+      .map((alias) => ({ alias, span: findLooseKeywordSpan(normalizedAnswer, alias) }))
+      .find((item) => item.span);
+    if (matched) {
       return {
         ok: true,
         has_answer: normalizedAnswer.length >= 20,
         matched: true,
         keyword,
-        matched_text: matchedAlias,
-        match_type: "browser_direct_text",
+        matched_text: normalizedAnswer.slice(matched.span.start, matched.span.end) || matched.alias,
+        match_type: matched.span.exact ? "browser_direct_text" : "browser_fuzzy_text",
         confidence: 1,
         source: "browser_direct",
-        reason: "回答正文已直接出现当前行目标关键词，立即停止追问",
+        reason: matched.span.exact
+          ? "回答正文已直接出现当前行目标关键词，立即停止追问"
+          : "回答正文出现带修饰词或品牌写法变体的目标关键词，立即停止追问",
       };
     }
   }

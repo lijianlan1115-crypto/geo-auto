@@ -144,15 +144,12 @@ def preserve_last_good_workbook(target):
 
 
 def save_workbook_atomic(workbook, target_path):
-    global RESULT_EXCEL
-
     target = Path(target_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_name(
         f".{target.stem}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp.xlsx"
     )
     backup = None
-    final_target = target
     try:
         workbook.save(temp)
     finally:
@@ -166,43 +163,28 @@ def save_workbook_atomic(workbook, target_path):
 
         for attempt in range(5):
             try:
-                os.replace(temp, final_target)
+                os.replace(temp, target)
                 break
             except PermissionError as exc:
                 if attempt == 4:
-                    # 某些 Windows 环境会被资源管理器预览、同步软件或安全软件
-                    # 短暂锁定目标文件。结果表无法覆盖时，自动改写到新文件，
-                    # 使当前任务继续运行而不是整体失败。
-                    if final_target == RESULT_EXCEL:
-                        fallback = create_result_excel_path(target.parent)
-                        os.replace(temp, fallback)
-                        RESULT_EXCEL = fallback
-                        service_config.RESULT_EXCEL = fallback
-                        final_target = fallback
-                        print(f"结果表被占用，已自动切换到新文件：{fallback}")
-                        break
-                    else:
-                        raise PermissionError(
-                            f"无法写入结果文件：{target}。请关闭 Excel/WPS、资源管理器预览窗格或同步工具后重试。"
-                        ) from exc
+                    # 同一批任务只使用一个结果文件。目标被 Excel/WPS 占用时
+                    # 保留 SQLite 和截图，稍后补写，绝不再生成第二个结果表。
+                    raise PermissionError(
+                        f"无法写入结果文件：{target}。请关闭 Excel/WPS、资源管理器预览窗格或同步工具；结果已保留，稍后会补写。"
+                    ) from exc
                 time.sleep(0.6)
 
         # 再校验最终路径，确保复制、同步或磁盘写入后用户拿到的仍是完整文件。
-        validate_workbook_file(final_target)
-        flush_file_to_disk(final_target)
+        validate_workbook_file(target)
+        flush_file_to_disk(target)
 
         if backup and backup.exists():
             backup.unlink()
-        return final_target
+        return target
     except Exception:
         # 替换后若最终校验失败，恢复此前的有效结果，损坏文件不会留在正式路径。
-        if backup and backup.exists() and final_target == target:
+        if backup and backup.exists():
             os.replace(backup, target)
-        elif final_target != target and final_target.exists():
-            invalid = final_target.with_name(
-                f".{final_target.name}.{int(time.time())}.invalid"
-            )
-            os.replace(final_target, invalid)
         raise
     finally:
         if temp.exists():
@@ -242,6 +224,7 @@ def init_db():
                 matched integer,
                 followup_count integer default 0,
                 screenshot_path text,
+                keywords_json text,
                 answer_text text,
                 error text,
                 created_at text not null,
@@ -255,6 +238,22 @@ def init_db():
             conn.execute("alter table tasks add column answer_debug text")
         if "run_debug" not in existing:
             conn.execute("alter table tasks add column run_debug text")
+        if "keywords_json" not in existing:
+            conn.execute("alter table tasks add column keywords_json text")
+        # 兼容旧数据库：旧版曾把关键词元数据临时放在 answer_text 中。
+        rows = conn.execute(
+            "select task_id, answer_text from tasks where keywords_json is null or keywords_json = ''"
+        ).fetchall()
+        for row in rows:
+            try:
+                keywords = json.loads(row["answer_text"] or "{}").get("keywords") or []
+            except Exception:
+                keywords = []
+            if keywords:
+                conn.execute(
+                    "update tasks set keywords_json = ? where task_id = ?",
+                    (json.dumps(keywords, ensure_ascii=False), row["task_id"]),
+                )
 
 
 def recover_interrupted_tasks():
@@ -484,9 +483,9 @@ def seed_tasks(clear_outputs=False):
                     """
                     insert into tasks (
                         task_id, row_number, row_id, question, platform, status,
-                        answer_text, created_at, updated_at
+                        keywords_json, answer_text, created_at, updated_at
                     )
-                    values (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    values (?, ?, ?, ?, ?, 'pending', ?, '', ?, ?)
                     """,
                     (
                         task_id,
@@ -494,7 +493,7 @@ def seed_tasks(clear_outputs=False):
                         str(row_id),
                         str(question).strip(),
                         platform,
-                        json.dumps({"keywords": row_keywords}, ensure_ascii=False),
+                        json.dumps(row_keywords, ensure_ascii=False),
                         now(),
                         now(),
                     ),
@@ -530,12 +529,12 @@ def pending_target_keyword_groups():
     groups = {}
     with connect_db() as conn:
         rows = conn.execute(
-            "select answer_text from tasks where status in ('pending', 'running', 'failed')"
+            "select keywords_json from tasks where status in ('pending', 'running', 'failed')"
         ).fetchall()
     cache = load_target_platform_context_cache()
     for row in rows:
         try:
-            keywords = json.loads(row["answer_text"] or "{}").get("keywords") or []
+            keywords = json.loads(row["keywords_json"] or "[]")
         except Exception:
             keywords = []
         keywords = [str(item or "").strip() for item in keywords if str(item or "").strip()]
@@ -601,11 +600,11 @@ def prefetch_pending_target_research():
     keyword_groups = set()
     with connect_db() as conn:
         rows = conn.execute(
-            "select answer_text from tasks where status in ('pending', 'running', 'failed')"
+            "select keywords_json from tasks where status in ('pending', 'running', 'failed')"
         ).fetchall()
     for row in rows:
         try:
-            keywords = json.loads(row["answer_text"] or "{}").get("keywords") or []
+            keywords = json.loads(row["keywords_json"] or "[]")
         except Exception:
             keywords = []
         normalized = tuple(str(item).strip() for item in keywords if str(item).strip())
@@ -651,8 +650,7 @@ def get_next_task(excluded_platforms=None):
     platform = PLATFORMS[task["platform"]]
     keywords = []
     try:
-        meta = json.loads(task["answer_text"] or "{}")
-        keywords = meta.get("keywords") or []
+        keywords = json.loads(task["keywords_json"] or "[]")
     except Exception:
         pass
     return {
@@ -962,6 +960,34 @@ def add_screenshot_to_worksheet(ws, screenshot_path, row_number, image_col):
     return True
 
 
+def resolve_result_row(ws, headers, result):
+    """用问题文本校验行号，避免并发任务或表格调整后截图写错问题行。"""
+    requested_row = int(result.get("row_number") or 0)
+    expected_question = compact_text(result.get("question"))
+    question_col = find_column(headers, QUESTION_HEADERS)
+
+    if question_col and expected_question:
+        if 2 <= requested_row <= ws.max_row:
+            actual = compact_text(ws.cell(row=requested_row, column=question_col).value)
+            if actual == expected_question:
+                return requested_row
+
+        matches = [
+            row
+            for row in range(2, ws.max_row + 1)
+            if compact_text(ws.cell(row=row, column=question_col).value) == expected_question
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise ValueError(f"结果表中找不到对应问题，拒绝插入截图：{expected_question[:80]}")
+        raise ValueError(f"结果表中存在重复问题，无法确定截图行：{expected_question[:80]}")
+
+    if 2 <= requested_row <= ws.max_row:
+        return requested_row
+    raise ValueError(f"无效的结果行号：{requested_row}")
+
+
 def write_result_to_excel(result, screenshot_path):
     with lock:
         wb = load_workbook(RESULT_EXCEL)
@@ -974,7 +1000,7 @@ def write_result_to_excel(result, screenshot_path):
         image_col = headers[platform_config["column"]]
         status_col = headers[f"{platform_config['column']}_状态"]
         followup_col = headers[f"{platform_config['column']}_追问次数"]
-        row_number = int(result["row_number"])
+        row_number = resolve_result_row(ws, headers, result)
 
         matched = bool(result.get("matched"))
         matched_keywords = result.get("matched_keywords") or []
@@ -1002,7 +1028,7 @@ def sync_result_from_db():
             with connect_db() as conn:
                 rows = conn.execute(
                     """
-                    select row_number, platform, status, matched, followup_count, screenshot_path, error
+                    select row_number, question, platform, status, matched, followup_count, screenshot_path, error
                     from tasks
                     where status in ('done', 'failed')
                     """
@@ -1024,12 +1050,13 @@ def sync_result_from_db():
                     status_text = f"失败：{compact_text(task['error'], 60)}"
                 else:
                     status_text = "命中" if task["matched"] else "未命中"
-                ws.cell(row=int(task["row_number"]), column=status_col, value=status_text)
-                ws.cell(row=int(task["row_number"]), column=followup_col, value=int(task["followup_count"] or 0))
+                row_number = resolve_result_row(ws, headers, dict(task))
+                ws.cell(row=row_number, column=status_col, value=status_text)
+                ws.cell(row=row_number, column=followup_col, value=int(task["followup_count"] or 0))
                 add_screenshot_to_worksheet(
                     ws,
                     task["screenshot_path"],
-                    int(task["row_number"]),
+                    row_number,
                     image_col,
                 )
             save_workbook_atomic(wb, RESULT_EXCEL)
