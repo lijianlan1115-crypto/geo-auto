@@ -119,7 +119,11 @@ def validate_workbook_file(path):
 
 def flush_file_to_disk(path):
     """请求操作系统把临时文件刷新到磁盘后再执行替换。"""
-    with Path(path).open("rb") as stream:
+    # Windows 的 os.fsync/_commit 不接受只读文件描述符，会抛出
+    # OSError: [Errno 9] Bad file descriptor。使用可读写二进制句柄，
+    # 不修改文件内容，只提交已经写入的缓存。
+    with Path(path).open("r+b") as stream:
+        stream.flush()
         os.fsync(stream.fileno())
 
 
