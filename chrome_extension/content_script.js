@@ -1465,6 +1465,44 @@ function isIgnoredLocateNode(node) {
   );
 }
 
+// 千问的最终回答在不同版本里可能仍位于类名包含 thinking/source/input 的
+// 外层容器中。通用过滤器会把这种祖先下面的正文一并排除，造成“判断已命中，
+// 但正文 Range/坐标为空”。千问只排除明确的交互区、导航区和插件浮层。
+function isIgnoredQianwenKeywordNode(node) {
+  const element = node && node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+  if (!element || !element.closest) return true;
+  return Boolean(
+    element.closest(
+      [
+        "#geo-auto-root",
+        ".geo-matched-badge",
+        ".geo-keyword-mark",
+        "[data-geo-overlay='1']",
+        "script",
+        "style",
+        "noscript",
+        "textarea",
+        "input",
+        "button",
+        "[contenteditable='true']",
+        "nav",
+        "aside",
+        "[role='navigation']",
+        "[class*='sidebar']",
+        "[class*='Sidebar']",
+        "[class*='history']",
+        "[class*='History']",
+        "[class*='composer']",
+        "[class*='toolbar']",
+        "[class*='footer']",
+        "[class*='suggest']",
+        "[class*='recommend']",
+        "[class*='answer-ask']",
+      ].join(",")
+    )
+  );
+}
+
 function findRootByAnswerContext(answerHit) {
   if (!answerHit) return null;
   const needles = [
@@ -1504,7 +1542,7 @@ function findRootByAnswerContext(answerHit) {
   return candidates.length ? candidates[0].node : null;
 }
 
-function findKeywordRangesInDOM(root, keyword) {
+function findKeywordRangesInDOM(root, keyword, ignoreNode = isIgnoredLocateNode) {
   if (!root || !keyword) return [];
 
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -1513,7 +1551,7 @@ function findKeywordRangesInDOM(root, keyword) {
 
   while (walker.nextNode()) {
     const node = walker.currentNode;
-    if (!node.parentElement || isIgnoredLocateNode(node.parentElement)) continue;
+    if (!node.parentElement || ignoreNode(node.parentElement)) continue;
     const raw = node.nodeValue || "";
     const normalized = normalizeKeywordText(raw);
 
@@ -1550,7 +1588,7 @@ function findKeywordRangesInDOM(root, keyword) {
   const ignoredChar = /\s|[，。！？、,.!?]/;
   while (crossWalker.nextNode() && normalizedChars.length < 200000) {
     const node = crossWalker.currentNode;
-    if (!node.parentElement || isIgnoredLocateNode(node.parentElement)) continue;
+    if (!node.parentElement || ignoreNode(node.parentElement)) continue;
     const raw = node.nodeValue || "";
     for (let offset = 0; offset < raw.length; offset++) {
       if (ignoredChar.test(raw[offset])) continue;
@@ -2079,7 +2117,7 @@ async function findKeywordWithNativeFind(searchTerms, preferredRoot = null) {
 }
 
 function qianwenKeywordNodeScore(node, term) {
-  if (!node || isIgnoredLocateNode(node)) return null;
+  if (!node || isIgnoredQianwenKeywordNode(node)) return null;
   if (node.querySelector && node.querySelector("textarea, input, [contenteditable='true']")) return null;
 
   // 千问定位只能命中回答正文。插件自身的固定提示层（例如右上角“命中”徽标）
@@ -2136,7 +2174,7 @@ function findQianwenKeywordMatches(searchTerms) {
       for (const term of uniqueList(searchTerms)) {
         const score = qianwenKeywordNodeScore(node, term);
         if (score === null) continue;
-        const matches = findKeywordRangesInDOM(node, term);
+        const matches = findKeywordRangesInDOM(node, term, isIgnoredQianwenKeywordNode);
         if (!matches.length) continue;
         candidates.push({ matches, score, node, term });
       }
