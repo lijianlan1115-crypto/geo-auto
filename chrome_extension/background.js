@@ -783,7 +783,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.action === "STOP") {
       running = false;
-      sendResponse({ ok: true, running });
+      const syncResult = await api("/sync-results", {
+        method: "POST",
+        body: JSON.stringify({ reason: "manual_stop" }),
+      }).catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }));
+      sendResponse({
+        ok: Boolean(syncResult && syncResult.ok),
+        running,
+        synced: Boolean(syncResult && syncResult.synced),
+        result_excel: syncResult && syncResult.result_excel ? syncResult.result_excel : "",
+        message: syncResult && syncResult.ok
+          ? "已停止，并已把已完成截图补写到结果 Excel"
+          : `已停止；Excel 暂未写入：${syncResult && syncResult.error ? syncResult.error : "请关闭 Excel/WPS 后重启服务补写"}`,
+      });
       return;
     }
 

@@ -233,6 +233,14 @@ def init_db():
             """
         )
         conn.execute("create index if not exists idx_tasks_status on tasks(status)")
+        conn.execute(
+            """
+            create table if not exists run_state (
+                key text primary key,
+                value text not null
+            )
+            """
+        )
         existing = {row[1] for row in conn.execute("pragma table_info(tasks)").fetchall()}
         if "answer_debug" not in existing:
             conn.execute("alter table tasks add column answer_debug text")
@@ -256,6 +264,23 @@ def init_db():
                 )
 
 
+def get_run_state(key, default=""):
+    if not DB_PATH.exists():
+        return default
+    with connect_db() as conn:
+        row = conn.execute("select value from run_state where key = ?", (str(key),)).fetchone()
+    return str(row["value"]) if row and row["value"] is not None else default
+
+
+def set_run_state(key, value):
+    with connect_db() as conn:
+        conn.execute(
+            "insert into run_state(key, value) values (?, ?) "
+            "on conflict(key) do update set value = excluded.value",
+            (str(key), str(value)),
+        )
+
+
 def recover_interrupted_tasks():
     """将上次退出时遗留的 running 任务恢复为可继续执行的 pending。"""
     with connect_db() as conn:
@@ -277,6 +302,57 @@ def read_headers(sheet):
     for cell in sheet[1]:
         if cell.value is not None:
             headers[str(cell.value).strip()] = cell.column
+    return headers
+
+
+def find_question_worksheet(workbook):
+    """始终写入真正包含问题列的数据 Sheet，不能依赖 WPS 保存的 activeTab。"""
+    candidates = []
+    for index, worksheet in enumerate(workbook.worksheets):
+        headers = read_headers(worksheet)
+        question_col = find_column(headers, QUESTION_HEADERS)
+        if question_col is None:
+            continue
+        populated = 0
+        for row_number in range(2, min(worksheet.max_row, 80) + 1):
+            if str(worksheet.cell(row=row_number, column=question_col).value or "").strip():
+                populated += 1
+        candidates.append((populated, -index, worksheet))
+    if not candidates:
+        detected = "；".join(
+            f"{sheet.title}: {', '.join(read_headers(sheet).keys()) or '空表头'}"
+            for sheet in workbook.worksheets
+        )
+        raise RuntimeError(
+            "Excel 所有工作表中都找不到问题列。"
+            f"支持列名：{QUESTION_HEADERS}。检测结果：{detected}"
+        )
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return candidates[0][2]
+
+
+def ensure_output_columns(worksheet):
+    """在问题表中补齐所选平台的截图、状态和追问次数列。"""
+    headers = read_headers(worksheet)
+    max_col = worksheet.max_column
+    for platform, item in PLATFORMS.items():
+        column_name = item["column"]
+        existing_col = find_platform_column(headers, platform)
+        if existing_col is None:
+            max_col += 1
+            worksheet.cell(row=1, column=max_col, value=column_name)
+            headers[column_name] = max_col
+        elif column_name not in headers:
+            headers[column_name] = existing_col
+
+    for item in PLATFORMS.values():
+        column_name = item["column"]
+        for suffix in ("_状态", "_追问次数"):
+            header = f"{column_name}{suffix}"
+            if header not in headers:
+                max_col += 1
+                worksheet.cell(row=1, column=max_col, value=header)
+                headers[header] = max_col
     return headers
 
 
@@ -351,7 +427,21 @@ def configure_platforms(platforms):
             f"delete from tasks where platform not in ({placeholders})",
             tuple(new_platforms.keys()),
         )
-    return {"ok": True, "platforms": runtime_platforms(), "stats": stats()}
+    # 结果表必须以插件当前渠道为准。平台配置成功后先建列、恢复已有截图，
+    # 完成后插件才可以开始领取任务。
+    if not sync_result_from_db():
+        return {
+            "ok": False,
+            "error": "无法生成渠道列或嵌入已有图片。请关闭 Excel/WPS 后重新点击开始。",
+            "platforms": runtime_platforms(),
+            "stats": stats(),
+        }
+    return {
+        "ok": True,
+        "platforms": runtime_platforms(),
+        "stats": stats(),
+        "result_excel": str(RESULT_EXCEL),
+    }
 
 
 def runtime_platforms():
@@ -394,7 +484,8 @@ def prepare_workbook(clear_outputs=False):
         shutil.copy2(INPUT_EXCEL, RESULT_EXCEL)
 
     wb = load_workbook(RESULT_EXCEL)
-    ws = wb.active
+    ws = find_question_worksheet(wb)
+    wb.active = wb.worksheets.index(ws)
     headers = read_headers(ws)
 
     if clear_outputs:
@@ -413,32 +504,7 @@ def prepare_workbook(clear_outputs=False):
     id_col = find_column(headers, ID_HEADERS)
     keyword_col = find_column(headers, KEYWORD_HEADERS)
 
-    # 第一段：所有平台结果图连续排列，方便横向比较。
-    max_col = ws.max_column
-    for platform, item in PLATFORMS.items():
-        column_name = item["column"]
-        existing_col = find_platform_column(headers, platform)
-        if existing_col is None:
-            max_col += 1
-            ws.cell(row=1, column=max_col, value=column_name)
-            headers[column_name] = max_col
-        elif column_name not in headers:
-            headers[column_name] = existing_col
-
-    # 第二段：结果图之后再统一放置状态和追问次数。
-    for platform, item in PLATFORMS.items():
-        column_name = item["column"]
-        status_name = f"{column_name}_状态"
-        if status_name not in headers:
-            max_col += 1
-            ws.cell(row=1, column=max_col, value=status_name)
-            headers[status_name] = max_col
-
-        followup_name = f"{column_name}_追问次数"
-        if followup_name not in headers:
-            max_col += 1
-            ws.cell(row=1, column=max_col, value=followup_name)
-            headers[followup_name] = max_col
+    ensure_output_columns(ws)
 
     save_workbook_atomic(wb, RESULT_EXCEL)
     return question_col, id_col, keyword_col
@@ -451,7 +517,7 @@ def seed_tasks(clear_outputs=False):
         return 0
 
     wb = load_workbook(INPUT_EXCEL, read_only=True, data_only=True)
-    ws = wb.active
+    ws = find_question_worksheet(wb)
 
     headers = read_headers(ws)
     question_col = find_column(headers, QUESTION_HEADERS)
@@ -694,6 +760,45 @@ def image_from_data_url(data_url, platform, task_id, matched):
     return path
 
 
+def mark_screenshot_from_dom_location(image_path, dom_location):
+    """按截图像素与浏览器视口比例二次画框，避免 Windows 缩放导致网页框丢失。"""
+    if not image_path or not isinstance(dom_location, dict):
+        return False
+    rect = dom_location.get("first_rect")
+    if not rect and dom_location.get("rects"):
+        rect = dom_location["rects"][0]
+    viewport = dom_location.get("screenshot_viewport") or {}
+    try:
+        rect_x = float(rect.get("x"))
+        rect_y = float(rect.get("y"))
+        rect_width = float(rect.get("width"))
+        rect_height = float(rect.get("height"))
+        viewport_width = float(viewport.get("width"))
+        viewport_height = float(viewport.get("height"))
+        if rect_width <= 0 or rect_height <= 0 or viewport_width <= 0 or viewport_height <= 0:
+            return False
+
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            image_width, image_height = image.size
+        scale_x = image_width / viewport_width
+        scale_y = image_height / viewport_height
+        bbox = [
+            max(0, round(rect_x * scale_x)),
+            max(0, round(rect_y * scale_y)),
+            min(image_width - 1, round((rect_x + rect_width) * scale_x)),
+            min(image_height - 1, round((rect_y + rect_height) * scale_y)),
+        ]
+        if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+            return False
+        mark_image(image_path, bbox)
+        return True
+    except Exception as exc:
+        print(f"DOM 截图二次标注失败：{exc}")
+        return False
+
+
 
 def process_screenshot_with_ocr(image_path, keywords, region_ratio=None):
     """
@@ -764,7 +869,7 @@ def get_test_keywords():
         }
 
     wb = load_workbook(INPUT_EXCEL, read_only=True)
-    ws = wb.active
+    ws = find_question_worksheet(wb)
     headers = read_headers(ws)
     keyword_col = find_column(headers, KEYWORD_HEADERS)
     question_col = find_column(headers, QUESTION_HEADERS)
@@ -991,8 +1096,9 @@ def resolve_result_row(ws, headers, result):
 def write_result_to_excel(result, screenshot_path):
     with lock:
         wb = load_workbook(RESULT_EXCEL)
-        ws = wb.active
-        headers = read_headers(ws)
+        ws = find_question_worksheet(wb)
+        wb.active = wb.worksheets.index(ws)
+        headers = ensure_output_columns(ws)
         migrate_images_inside_cells(ws)
 
         platform = result["platform"]
@@ -1035,8 +1141,9 @@ def sync_result_from_db():
                 ).fetchall()
 
             wb = load_workbook(RESULT_EXCEL)
-            ws = wb.active
-            headers = read_headers(ws)
+            ws = find_question_worksheet(wb)
+            wb.active = wb.worksheets.index(ws)
+            headers = ensure_output_columns(ws)
             for task in rows:
                 platform = PLATFORMS.get(task["platform"])
                 if not platform:
@@ -1064,6 +1171,16 @@ def sync_result_from_db():
     except Exception as exc:
         print(f"结果表同步暂缓（任务状态已保存在 SQLite）：{exc}")
         return False
+
+
+def sync_results_api():
+    synced = sync_result_from_db()
+    return {
+        "ok": synced,
+        "synced": synced,
+        "result_excel": str(RESULT_EXCEL),
+        "error": "" if synced else "Excel 写入失败。请关闭 Excel/WPS 后重试。",
+    }
 
 
 def submit_result(payload):
@@ -1095,7 +1212,12 @@ def submit_result(payload):
         matched,
     )
 
+    dom_box_marked = False
     if screenshot_path and payload.get("platform") == "qianwen" and matched:
+        dom_box_marked = mark_screenshot_from_dom_location(screenshot_path, dom_location)
+        payload["dom_box_marked"] = dom_box_marked
+
+    if screenshot_path and payload.get("platform") == "qianwen" and matched and not dom_box_marked:
         ocr_keywords = payload.get("keywords") or matched_keywords or content_keywords
         ocr_result = process_screenshot_with_ocr(
             screenshot_path,
@@ -1560,6 +1682,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, reset_all_tasks())
             elif path == "/finalize-batch":
                 self._send(200, finalize_batch())
+            elif path == "/sync-results":
+                result = sync_results_api()
+                self._send(200 if result["ok"] else 409, result)
             elif path == "/target-platform-context":
                 self._send(200, save_target_platform_context(payload))
             else:
@@ -1576,11 +1701,11 @@ def create_service_server():
     server = ReusableThreadingHTTPServer((HOST, PORT), Handler)
     try:
         init_db()
+        bind_result_excel_to_progress()
         recovered = recover_interrupted_tasks()
         created = seed_tasks()
         # 直接追问模式不再启动后台目标搜索，避免它与窗口追问争抢同一AI接口。
         research_groups = 0
-        sync_result_from_db()
     except Exception:
         server.server_close()
         raise
@@ -1594,12 +1719,12 @@ def create_service_server():
 
 
 def input_matches_existing_progress(input_path):
-    if not DB_PATH.exists() or not RESULT_EXCEL.exists():
+    if not DB_PATH.exists():
         return False
 
     workbook = load_workbook(input_path, read_only=True, data_only=True)
     try:
-        worksheet = workbook.active
+        worksheet = find_question_worksheet(workbook)
         headers = read_headers(worksheet)
         question_col = find_column(headers, QUESTION_HEADERS)
         if question_col is None:
@@ -1619,6 +1744,35 @@ def input_matches_existing_progress(input_path):
         workbook.close()
 
 
+def latest_result_excel(output_dir):
+    candidates = [
+        path
+        for path in Path(output_dir).glob("GEO反馈结果_*.xlsx")
+        if path.is_file() and not path.name.startswith(".")
+    ]
+    return max(candidates, key=lambda path: path.name) if candidates else None
+
+
+def bind_result_excel_to_progress():
+    """把 SQLite 进度重新绑定到原结果表，避免重启后另建空 Excel。"""
+    global RESULT_EXCEL
+
+    stored_text = get_run_state("result_excel", "")
+    stored = Path(stored_text).expanduser() if stored_text else None
+    if stored and stored.parent == OUTPUT_DIR and stored.exists():
+        RESULT_EXCEL = stored
+    else:
+        with connect_db() as conn:
+            task_count = int(conn.execute("select count(*) from tasks").fetchone()[0] or 0)
+        fallback = latest_result_excel(OUTPUT_DIR) if task_count else None
+        if fallback:
+            RESULT_EXCEL = fallback
+
+    service_config.RESULT_EXCEL = RESULT_EXCEL
+    set_run_state("result_excel", RESULT_EXCEL)
+    return RESULT_EXCEL
+
+
 def configure_input_excel(input_path):
     global INPUT_EXCEL, RESULT_EXCEL
 
@@ -1627,8 +1781,11 @@ def configure_input_excel(input_path):
         raise FileNotFoundError(f"找不到输入 Excel：{new_path}")
 
     init_db()
+    bind_result_excel_to_progress()
     if input_matches_existing_progress(new_path):
         INPUT_EXCEL = new_path
+        service_config.INPUT_EXCEL = INPUT_EXCEL
+        set_run_state("input_excel", INPUT_EXCEL)
         return {
             "ok": True,
             "input_excel": str(INPUT_EXCEL),
@@ -1644,8 +1801,11 @@ def configure_input_excel(input_path):
         service_config.RESULT_EXCEL = RESULT_EXCEL
 
     INPUT_EXCEL = new_path
+    service_config.INPUT_EXCEL = INPUT_EXCEL
     with lock, connect_db() as conn:
         conn.execute("delete from tasks")
+    set_run_state("input_excel", INPUT_EXCEL)
+    set_run_state("result_excel", RESULT_EXCEL)
 
     return {
         "ok": True,
@@ -1670,19 +1830,33 @@ def create_result_excel_path(output_dir):
 
 def configure_output_dir(output_dir):
     global OUTPUT_DIR, SCREENSHOT_DIR, RESULT_EXCEL, TEMP_ANSWERS_EXCEL, DB_PATH
+    global TARGET_PLATFORM_CONTEXT_PATH
 
     OUTPUT_DIR = Path(output_dir).expanduser().resolve()
     SCREENSHOT_DIR = OUTPUT_DIR / "screenshots"
-    RESULT_EXCEL = create_result_excel_path(OUTPUT_DIR)
     TEMP_ANSWERS_EXCEL = OUTPUT_DIR / "ai返回内容临时表.xlsx"
     DB_PATH = OUTPUT_DIR / "progress.sqlite"
+    TARGET_PLATFORM_CONTEXT_PATH = OUTPUT_DIR / "target_platform_context_cache.json"
 
     service_config.OUTPUT_DIR = OUTPUT_DIR
     service_config.SCREENSHOT_DIR = SCREENSHOT_DIR
-    service_config.RESULT_EXCEL = RESULT_EXCEL
     service_config.TEMP_ANSWERS_EXCEL = TEMP_ANSWERS_EXCEL
     service_config.DB_PATH = DB_PATH
     ensure_dirs()
+    init_db()
+
+    stored_text = get_run_state("result_excel", "")
+    stored = Path(stored_text).expanduser() if stored_text else None
+    with connect_db() as conn:
+        task_count = int(conn.execute("select count(*) from tasks").fetchone()[0] or 0)
+    if stored and stored.parent == OUTPUT_DIR and stored.exists():
+        RESULT_EXCEL = stored
+    elif task_count and latest_result_excel(OUTPUT_DIR):
+        RESULT_EXCEL = latest_result_excel(OUTPUT_DIR)
+    else:
+        RESULT_EXCEL = create_result_excel_path(OUTPUT_DIR)
+    service_config.RESULT_EXCEL = RESULT_EXCEL
+    set_run_state("result_excel", RESULT_EXCEL)
     return {
         "ok": True,
         "output_dir": str(OUTPUT_DIR),

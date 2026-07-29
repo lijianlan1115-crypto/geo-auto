@@ -97,6 +97,9 @@ class DesktopApp:
         # 后续启动读取 settings.json，继续使用同一个结果文件以支持断点续跑。
         if not DESKTOP_SETTINGS.get("result_excel"):
             service_server.configure_output_dir(service_config.OUTPUT_DIR)
+        else:
+            service_server.init_db()
+            service_server.bind_result_excel_to_progress()
 
         self.input_excel = Path(service_config.INPUT_EXCEL)
         self.output_dir = Path(service_config.OUTPUT_DIR)
@@ -483,6 +486,10 @@ class DesktopApp:
             return
 
         def stop():
+            try:
+                service_server.sync_result_from_db()
+            except Exception as exc:
+                print(f"停止服务前同步结果失败：{exc}")
             server.shutdown()
             server.server_close()
             self.http_server = None

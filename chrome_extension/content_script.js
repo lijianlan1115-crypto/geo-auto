@@ -1649,6 +1649,16 @@ function scrollContainerToCenterSmooth(container, rect) {
 
 function targetRectForKeywordMatch(match) {
   if (!match || !match.range) return null;
+  // getBoundingClientRect 是整个跨节点 Range 的并集；千问经常把品牌、修饰词、
+  // 菜名拆成多个 span，不能只取第一个 client rect，否则只会框到“老街杨家”。
+  const preciseRect = match.range.getBoundingClientRect();
+  if (
+    preciseRect && preciseRect.width > 0 && preciseRect.height > 0 &&
+    preciseRect.top >= 0 && preciseRect.bottom <= window.innerHeight &&
+    preciseRect.height <= window.innerHeight * 0.35
+  ) {
+    return preciseRect;
+  }
   const start = match.range.startContainer;
   const element = start && start.nodeType === Node.TEXT_NODE ? start.parentElement : start;
   if (!element) return bestRangeRect(match.range);
@@ -2106,6 +2116,8 @@ function qianwenKeywordNodeScore(node, term) {
   score -= Math.max(0, rect.width * rect.height - window.innerWidth * window.innerHeight * 0.45) / 2500;
   score += Math.max(0, rect.left - window.innerWidth * 0.18) / 100;
   score += Math.max(0, rect.top + window.scrollY) / 5000;
+  // 同一段同时命中简称和完整目标词时，必须优先框完整目标词。
+  score += normalizedTerm.length * 30;
   return score;
 }
 
@@ -2355,14 +2367,15 @@ async function drawKeywordAndEnsureViewportSmooth(match) {
   scrollKeywordToCenter(match.range);
   await waitForScrollStable(800, nearestScrollableContainer(match.range.startContainer));
   await forceCenterQianwenMatch(match, 700);
-  let rects = drawDOMKeywordBoxes([match]);
+  clearKeywordMarks();
+  let rects = drawBoxFromRect(targetRectForKeywordMatch(match), 8);
   await new Promise((resolve) => requestAnimationFrame(resolve));
   await sleep(220);
   if (!keywordMarkFullyInViewport()) {
     clearKeywordMarks();
     scrollKeywordToCenter(match.range);
     await waitForScrollStable(800, nearestScrollableContainer(match.range.startContainer));
-    rects = drawDOMKeywordBoxes([match]);
+    rects = drawBoxFromRect(targetRectForKeywordMatch(match), 8);
     await sleep(220);
   }
   return rects;
@@ -2458,7 +2471,8 @@ function renderedAnswerKeywordHit(platform, keywords) {
 }
 
 async function locateAndMarkKeywordForScreenshot(platform, answerText, matchedKeywords, judgeResult, keywords) {
-  const searchTerms = keywordSearchTerms(matchedKeywords, judgeResult, keywords);
+  const searchTerms = keywordSearchTerms(matchedKeywords, judgeResult, keywords)
+    .sort((left, right) => normalizeKeywordText(right).length - normalizeKeywordText(left).length);
   clearKeywordMarks();
 
   if (platform === "qianwen") {
@@ -2893,6 +2907,14 @@ async function runPlatformTask(task) {
     !keywordMarkFullyInViewport()
   );
   const annotationRect = shouldAnnotateImage ? domLocation.first_rect : null;
+
+  if (domLocation && domLocation.matched) {
+    domLocation.screenshot_viewport = {
+      width: window.innerWidth,
+      height: window.innerHeight,
+      device_pixel_ratio: window.devicePixelRatio || 1,
+    };
+  }
 
   await prepareForScreenshot();
   screenshotDataUrl = await captureVisibleScreenshot();
