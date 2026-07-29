@@ -311,24 +311,29 @@ def read_headers(sheet):
 def find_question_worksheet(workbook):
     """始终写入真正包含问题列的数据 Sheet，不能依赖 WPS 保存的 activeTab。"""
     candidates = []
+    detected = []
     for index, worksheet in enumerate(workbook.worksheets):
-        headers = read_headers(worksheet)
-        question_col = find_column(headers, QUESTION_HEADERS)
-        if question_col is None:
+        try:
+            headers = read_headers(worksheet)
+            detected.append(f"{worksheet.title}: {', '.join(headers.keys()) or '空表头'}")
+            question_col = find_column(headers, QUESTION_HEADERS)
+            if question_col is None:
+                continue
+            populated = 0
+            for row_number in range(2, min(worksheet.max_row, 80) + 1):
+                if str(worksheet.cell(row=row_number, column=question_col).value or "").strip():
+                    populated += 1
+            candidates.append((populated, -index, worksheet))
+        except Exception as exc:
+            # 一个 WPS 辅助 Sheet 的 dimension/style XML 异常，不能阻断正常
+            # 问题 Sheet。旧版本只读 Sheet1 能成功，扫描版必须逐 Sheet 隔离。
+            detected.append(f"{worksheet.title}: 跳过异常工作表（{type(exc).__name__}: {exc}）")
+            print(f"跳过无法读取的工作表 {worksheet.title}：{type(exc).__name__}: {exc}")
             continue
-        populated = 0
-        for row_number in range(2, min(worksheet.max_row, 80) + 1):
-            if str(worksheet.cell(row=row_number, column=question_col).value or "").strip():
-                populated += 1
-        candidates.append((populated, -index, worksheet))
     if not candidates:
-        detected = "；".join(
-            f"{sheet.title}: {', '.join(read_headers(sheet).keys()) or '空表头'}"
-            for sheet in workbook.worksheets
-        )
         raise RuntimeError(
             "Excel 所有工作表中都找不到问题列。"
-            f"支持列名：{QUESTION_HEADERS}。检测结果：{detected}"
+            f"支持列名：{QUESTION_HEADERS}。检测结果：{'；'.join(detected)}"
         )
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return candidates[0][2]
