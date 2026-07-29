@@ -2377,6 +2377,49 @@ function keywordSearchTerms(matchedKeywords, judgeResult, keywords = []) {
   ]).filter((term) => String(term || "").trim().length >= 2);
 }
 
+function renderedAnswerKeywordHit(platform, keywords) {
+  const targetKeywords = splitKeywords(keywords);
+  const searchTerms = uniqueList(targetKeywords.flatMap((keyword) => (
+    typeof keywordAliasesForPrompt === "function"
+      ? keywordAliasesForPrompt([keyword])
+      : [keyword]
+  ))).filter((term) => String(term || "").trim().length >= 2);
+  if (!searchTerms.length) return null;
+
+  let matches = [];
+  if (platform === "qianwen") {
+    // 千问提取 answerText 偶尔只拿到部分段落；追问前直接检查实际渲染的
+    // 回答正文，命中后立即停止，不能继续依赖不完整的文本提取结果。
+    matches = findQianwenKeywordMatches(searchTerms);
+  } else {
+    const answerRoot = GEO_LAST_ANSWER_ELEMENT && document.body.contains(GEO_LAST_ANSWER_ELEMENT)
+      ? GEO_LAST_ANSWER_ELEMENT
+      : document.body;
+    matches = findFirstKeywordMatches(searchTerms, answerRoot);
+  }
+  if (!matches.length) return null;
+
+  const matchedAlias = String(matches[0].keyword || "").trim();
+  const canonicalKeyword = targetKeywords.find((keyword) => {
+    const aliases = typeof keywordAliasesForPrompt === "function"
+      ? keywordAliasesForPrompt([keyword])
+      : [keyword];
+    return aliases.some((alias) => normalizeKeywordText(alias) === normalizeKeywordText(matchedAlias));
+  }) || targetKeywords[0] || matchedAlias;
+
+  return {
+    ok: true,
+    has_answer: true,
+    matched: true,
+    keyword: canonicalKeyword,
+    matched_text: matchedAlias || canonicalKeyword,
+    match_type: "rendered_answer_dom",
+    confidence: 1,
+    source: "browser_dom_guard",
+    reason: "页面实际渲染的回答正文已出现当前行目标关键词，追问前强制停止",
+  };
+}
+
 async function locateAndMarkKeywordForScreenshot(platform, answerText, matchedKeywords, judgeResult, keywords) {
   const searchTerms = keywordSearchTerms(matchedKeywords, judgeResult, keywords);
   clearKeywordMarks();
@@ -2643,6 +2686,9 @@ async function runPlatformTask(task) {
   await sendPrompt(task.platform, task.question);
   answerText = await waitAnswerStable(task, previousText);
   judgeResult = await judgeAnswer(answerText, keywords, task);
+  if (!judgeResult.matched) {
+    judgeResult = renderedAnswerKeywordHit(task.platform, keywords) || judgeResult;
+  }
   runDebug.push({
     round: 0,
     type: "initial",
@@ -2667,6 +2713,9 @@ async function runPlatformTask(task) {
     lastPrompt = prompt;
     answerText = await waitAnswerStable(task, previousText);
     judgeResult = await judgeAnswer(answerText, keywords, task);
+    if (!judgeResult.matched) {
+      judgeResult = renderedAnswerKeywordHit(task.platform, keywords) || judgeResult;
+    }
     runDebug.push({
       round: followupCount,
       type: "followup",
@@ -2693,7 +2742,10 @@ async function runPlatformTask(task) {
   const finalAnswerText = await waitForFinalAnswerRender(task, answerText);
   if (normalizeKeywordText(finalAnswerText) !== normalizeKeywordText(answerText)) {
     answerText = finalAnswerText;
-    const finalJudge = await judgeAnswer(answerText, keywords, task);
+    let finalJudge = await judgeAnswer(answerText, keywords, task);
+    if (!finalJudge.matched) {
+      finalJudge = renderedAnswerKeywordHit(task.platform, keywords) || finalJudge;
+    }
     runDebug.push({
       round: followupCount,
       type: "final_stable_check",
