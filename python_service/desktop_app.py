@@ -571,7 +571,10 @@ class DesktopApp:
         workbook = load_workbook(path, read_only=True, data_only=True)
 
         try:
-            worksheet = workbook.active
+            # WPS 的多 Sheet 文件有时会留下越界的 activeTab 索引，直接访问
+            # workbook.active 会报 tuple/list index out of range。输入校验必须
+            # 与服务端一致，扫描所有 Sheet 找到真正包含“问题”列的数据表。
+            worksheet = service_server.find_question_worksheet(workbook)
             headers = {
                 str(cell.value).strip()
                 for cell in worksheet[1]
