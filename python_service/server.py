@@ -301,7 +301,8 @@ def recover_interrupted_tasks():
 
 def read_headers(sheet):
     headers = {}
-    for cell in sheet[1]:
+    first_row = next(sheet.iter_rows(min_row=1, max_row=1), ())
+    for cell in first_row:
         if cell.value is not None:
             headers[str(cell.value).strip()] = cell.column
     return headers
@@ -525,7 +526,10 @@ def seed_tasks(clear_outputs=False):
         print(f"任务初始化跳过：找不到输入 Excel：{INPUT_EXCEL}")
         return 0
 
-    wb = load_workbook(INPUT_EXCEL, read_only=True, data_only=True)
+    # WPS 生成的 dimension 元数据偶尔不规范；openpyxl 只读模式对这类文件
+    # 使用 ws.cell() 时可能抛出 tuple index out of range。输入表规模有限，
+    # 使用普通兼容模式更可靠，并关闭无关的外部链接解析。
+    wb = load_workbook(INPUT_EXCEL, read_only=False, data_only=True, keep_links=False)
     ws = find_question_worksheet(wb)
 
     headers = read_headers(ws)
@@ -877,7 +881,7 @@ def get_test_keywords():
             "message": f"找不到输入 Excel：{INPUT_EXCEL}",
         }
 
-    wb = load_workbook(INPUT_EXCEL, read_only=True)
+    wb = load_workbook(INPUT_EXCEL, read_only=False, data_only=True, keep_links=False)
     ws = find_question_worksheet(wb)
     headers = read_headers(ws)
     keyword_col = find_column(headers, KEYWORD_HEADERS)
@@ -1768,7 +1772,7 @@ def input_matches_existing_progress(input_path):
     if not DB_PATH.exists():
         return False
 
-    workbook = load_workbook(input_path, read_only=True, data_only=True)
+    workbook = load_workbook(input_path, read_only=False, data_only=True, keep_links=False)
     try:
         worksheet = find_question_worksheet(workbook)
         headers = read_headers(worksheet)
