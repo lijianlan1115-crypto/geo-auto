@@ -7,7 +7,7 @@ const PLATFORM_RULES = {
   qianwen: {
     input: ['textarea', '[contenteditable="true"]', '.ant-input', '[placeholder*="输入"]'],
     send: ['button[type="submit"]', 'button[aria-label*="发送"]', 'button:has(svg)', '.ant-btn-primary', '[class*="send"]', '[class*="Submit"]'],
-    answer: ['.markdown-body', '.ant-typography', '[class*="message-content"]', '[class*="content"]', '[class*="assistant"]', '[class*="response"]', 'main'],
+    answer: ['.answer-common-card', '.qk-markdown', '.qk-md-paragraph', '.markdown-body', '.ant-typography', '[class*="message-content"]', '[class*="content"]', '[class*="assistant"]', '[class*="response"]', 'main'],
   },
   deepseek: {
     input: ['textarea', '[contenteditable="true"]'],
@@ -29,7 +29,7 @@ const PLATFORM_RULES = {
 const DEFAULT_SERVER_URL = "http://127.0.0.1:8765";
 const DEFAULT_PLATFORM_URLS = {
   doubao: "https://www.doubao.com/chat/",
-  qianwen: "https://tongyi.aliyun.com/qianwen/",
+  qianwen: "https://www.qianwen.com/",
   deepseek: "https://chat.deepseek.com/",
   yuanbao: "https://yuanbao.tencent.com/chat/",
   wenxin: "https://chat.baidu.com/?enter_type=yiyan_site",
@@ -49,6 +49,7 @@ const DEFAULT_PLATFORMS = Object.entries(DEFAULT_PLATFORM_URLS).map(([key, url])
 
 let GEO_LAST_ANSWER_ELEMENT = null;
 let GEO_LAST_ANSWER_DEBUG = null;
+let GEO_ACTIVE_KEYWORD_RANGE = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -924,22 +925,56 @@ function getAnswerCandidates(platform) {
   const seen = new Set();
   const candidates = [];
 
-  // 千问特殊处理：查找包含回答内容的容器
+  // 千问特殊处理：只读取聊天正文，绝不能把左侧历史会话算作回答。
   if (platform === "qianwen") {
-    const allTextBlocks = Array.from(document.querySelectorAll('[class*="message"], [class*="content"], [class*="answer"], [class*="response"], .ant-typography, .markdown-body, p, div'))
+    const qianwenSelectors = [
+      ".chat-answers-card-wrap",
+      ".answer-common-card",
+      "#qk-markdown-react",
+      ".qk-markdown",
+      ".qk-md-paragraph",
+      ".markdown-react",
+      ".markdown-body",
+      "main [class*='answer-card']",
+      "main [class*='AnswerCard']",
+      "main [class*='message-assistant']",
+      "main [class*='assistant-message']",
+      "main [class*='assistant']",
+      "main [class*='response']",
+      "main [class*='markdown']",
+      "main article",
+    ];
+    const excludedChrome = [
+      "aside",
+      "nav",
+      "header",
+      "[role='navigation']",
+      "[class*='history']",
+      "[class*='History']",
+      "[class*='session-list']",
+      "[class*='conversation-list']",
+      "[class*='recent-chat']",
+    ].join(",");
+    const allTextBlocks = Array.from(document.querySelectorAll(qianwenSelectors.join(",")))
       .filter((node) => {
         if (seen.has(node)) return false;
         seen.add(node);
         if (node.closest("#geo-auto-root")) return false;
-        if (isIgnoredLocateNode(node)) return false;
+        if (node.closest(excludedChrome)) return false;
+        // 页面级祖先可能同时包住 aside 和正文，不能把这种容器当回答。
+        if (node.querySelector("aside, nav, [role='navigation'], textarea, input, [contenteditable='true']")) return false;
+        // 千问主内容区的祖先也使用 bg-pc-sidebar 类名，不能套用通用
+        // isIgnoredLocateNode；这里已经通过 aside/nav 和位置单独排除左栏。
+        if (node.closest("script, style, noscript, button, [class*='composer'], [class*='toolbar'], [class*='footer']")) return false;
         const text = (node.innerText || node.textContent || "").trim();
         const rect = node.getBoundingClientRect();
         if (text.length <= 10 || rect.width <= 0 || rect.height <= 0) return false;
         // 排除输入框和用户消息区域
         const className = String(node.className || "");
         if (/send-msg|send-bubble|user-message|human-message|question|query|user/i.test(className) && !/answer|assistant|agent|markdown|response/i.test(className)) return false;
-        // 排除侧边栏、工具栏等
-        if (window.innerWidth > 900 && rect.right < window.innerWidth * 0.18) return false;
+        // 千问桌面端左栏约 256px；正文候选的左边缘必须位于内容区。
+        if (window.innerWidth > 900 && rect.left < Math.min(220, window.innerWidth * 0.16)) return false;
+        if (rect.width >= window.innerWidth * 0.94 && rect.height >= window.innerHeight * 0.8) return false;
         return true;
       });
     candidates.push(...allTextBlocks);
@@ -1065,8 +1100,12 @@ function textFromNode(node) {
 }
 
 function getAnswerText(platform) {
-  return getAnswerCandidates(platform)
-    .slice(0, 8)
+  const candidates = getAnswerCandidates(platform);
+  // 千问候选中常同时存在回答卡片和其 markdown 子节点；只取评分最高的
+  // 当前回答，避免拼接页面级容器或历史内容造成误命中。
+  const limit = platform === "qianwen" ? 1 : 8;
+  return candidates
+    .slice(0, limit)
     .map(textFromNode)
     .filter(Boolean)
     .join("\n")
@@ -1208,7 +1247,11 @@ async function waitAnswerStable(task, previousText = "") {
       keywordSeen = containsAnyTargetKeyword(text, keywords);
       if (normalized && normalized !== previousNormalized && !transient) sawNewAnswer = true;
     }
-    const requiredStableMs = Math.max(stableMs, keywordSeen ? keywordStableMs : 0);
+    // 已经出现目标关键词时使用更短的关键词稳定窗口；旧逻辑取 max，
+    // 导致配置的 2 秒永远被普通 3 秒覆盖，命中后仍无意义地多等。
+    const requiredStableMs = keywordSeen
+      ? Math.max(800, Math.min(stableMs, keywordStableMs))
+      : stableMs;
     const candidate = findLatestAnswerElement(task.platform, previousText, lastText);
     const candidateText = textFromNode(candidate);
     const candidateLength = normalizeKeywordText(candidateText).length;
@@ -1424,8 +1467,11 @@ function getAnswerKeywordHit(answerText, keywords, judgeResult = null) {
 }
 
 function isIgnoredLocateNode(node) {
+  const element = node && node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+  if (!element || !element.closest) return true;
+  if (isSidePanelKeywordNode(element)) return true;
   return Boolean(
-    node.closest(
+    element.closest(
       [
         "#geo-auto-root",
         ".geo-matched-badge",
@@ -1441,8 +1487,6 @@ function isIgnoredLocateNode(node) {
         "nav",
         "aside",
         "[role='navigation']",
-        "[class*='sidebar']",
-        "[class*='Sidebar']",
         "[class*='history']",
         "[class*='History']",
         "[class*='composer']",
@@ -1463,6 +1507,20 @@ function isIgnoredLocateNode(node) {
       ].join(",")
     )
   );
+}
+
+// 豆包、元宝等站点的左侧历史标题可能与正文标题完全相同。即使左栏滚动
+// 容器已经被排除，若先选中了其中的文字，scrollIntoView 仍会把左栏滚动。
+// 因此在“文字候选”阶段也用语义和几何位置双重排除左侧栏。
+function isSidePanelKeywordNode(node) {
+  const element = node && node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+  if (!element || !element.closest) return true;
+  if (element.closest("nav, aside, [role='navigation']")) return true;
+  if (window.innerWidth <= 900) return false;
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0 &&
+    rect.left < window.innerWidth * 0.12 &&
+    rect.right <= window.innerWidth * 0.32;
 }
 
 // 千问的最终回答在不同版本里可能仍位于类名包含 thinking/source/input 的
@@ -1488,8 +1546,6 @@ function isIgnoredQianwenKeywordNode(node) {
         "nav",
         "aside",
         "[role='navigation']",
-        "[class*='sidebar']",
-        "[class*='Sidebar']",
         "[class*='history']",
         "[class*='History']",
         "[class*='composer']",
@@ -1636,12 +1692,23 @@ function findCharIndexByNormalizedIndex(raw, normalizedIndex) {
   return raw.length;
 }
 
+function isSidePanelScrollContainer(node) {
+  if (!node || node === document.body || node === document.documentElement || node === document.scrollingElement) return false;
+  if (node.closest && node.closest("nav, aside, [role='navigation']")) return true;
+  const className = String(node.className || "");
+  if (/sidebar|side-bar|history|conversation-list|session-list|nav-list/i.test(className)) return true;
+  if (window.innerWidth <= 900) return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.width <= 380 && rect.left < window.innerWidth * 0.12 && rect.right <= window.innerWidth * 0.32;
+}
+
 function scrollableContainers(root = document.body) {
   const base = root && document.body.contains(root) ? root : document.body;
   const nodes = [document.scrollingElement || document.documentElement, ...Array.from(base.querySelectorAll("*"))];
   return uniqueNodes(nodes.filter((node) => {
     if (!node || node.nodeType !== 1) return false;
     if (isIgnoredLocateNode(node)) return false;
+    if (isSidePanelScrollContainer(node)) return false;
     const style = window.getComputedStyle(node);
     const canScrollY = /(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflow}`);
     if (!canScrollY && node !== document.scrollingElement && node !== document.documentElement) return false;
@@ -1653,7 +1720,7 @@ function nearestScrollableContainer(element) {
   let node = element && element.nodeType === Node.TEXT_NODE ? element.parentElement : element;
   while (node && node !== document.body && node !== document.documentElement) {
     const style = window.getComputedStyle(node);
-    if (/(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflow}`) && node.scrollHeight > node.clientHeight + 40) {
+    if (!isSidePanelScrollContainer(node) && /(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflow}`) && node.scrollHeight > node.clientHeight + 40) {
       return node;
     }
     node = node.parentElement;
@@ -1663,6 +1730,7 @@ function nearestScrollableContainer(element) {
 
 function scrollContainerToCenter(container, rect) {
   if (!container || !rect) return;
+  if (isSidePanelScrollContainer(container)) return;
   if (container === document.scrollingElement || container === document.documentElement || container === document.body) {
     const targetTop = window.scrollY + rect.top - window.innerHeight / 2 + rect.height / 2;
     window.scrollTo(0, Math.max(0, targetTop));
@@ -1675,6 +1743,7 @@ function scrollContainerToCenter(container, rect) {
 
 function scrollContainerToCenterSmooth(container, rect) {
   if (!container || !rect) return;
+  if (isSidePanelScrollContainer(container)) return;
   if (container === document.scrollingElement || container === document.documentElement || container === document.body) {
     const targetTop = window.scrollY + rect.top - window.innerHeight * 0.45 + rect.height / 2;
     window.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
@@ -1725,7 +1794,7 @@ async function waitForScrollStable(timeoutMs = 3000, container = null) {
     const current = scrollSnapshot(container);
     if (Math.abs(current.windowY - last.windowY) < 5 && Math.abs(current.targetTop - last.targetTop) < 5) {
       stableCount++;
-      if (stableCount >= 5) return true;
+      if (stableCount >= 3) return true;
     } else {
       stableCount = 0;
     }
@@ -1866,13 +1935,17 @@ function drawDOMKeywordBoxes(ranges) {
   clearKeywordMarks();
 
   const rects = [];
-  for (const item of ranges.slice(0, 3)) {
-    const rangeRect = bestRangeRect(item.range);
-    const keywordRects = drawBoxFromRect(rangeRect, 8);
-    if (keywordRects.length) {
-      rects.push(...keywordRects);
-      continue;
+  // 只标注回答正文中第一处最可信命中。旧逻辑最多画三处，商品卡、引用
+  // 和正文重复出现目标词时会产生多个看似“框偏了”的标注。
+  for (const item of ranges.slice(0, 1)) {
+    const rangeRects = Array.from(item.range.getClientRects ? item.range.getClientRects() : [])
+      .filter((rect) => rect.width > 0 && rect.height > 0)
+      .slice(0, 3);
+    for (const rangeRect of rangeRects) {
+      const keywordRects = drawBoxFromRect(rangeRect, 4);
+      if (keywordRects.length) rects.push(...keywordRects);
     }
+    if (rects.length) continue;
 
     const target = markerTargetForRange(item.range);
     if (target) {
@@ -1949,6 +2022,7 @@ function scrollKeywordToCenter(range) {
   const start = range.startContainer;
   const element = start.nodeType === Node.TEXT_NODE ? start.parentElement : start;
   if (!element) return false;
+  if (isIgnoredLocateNode(element) || isSidePanelKeywordNode(element)) return false;
 
   const container = nearestScrollableContainer(element);
   if (element.scrollIntoView) {
@@ -1973,6 +2047,7 @@ async function smoothScrollKeywordToCenter(range, waitMs = 3600) {
   const start = range && range.startContainer;
   const element = start && start.nodeType === Node.TEXT_NODE ? start.parentElement : start;
   if (!element) return false;
+  if (isIgnoredLocateNode(element) || isSidePanelKeywordNode(element)) return false;
 
   const container = nearestScrollableContainer(element);
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -2114,6 +2189,103 @@ async function findKeywordWithNativeFind(searchTerms, preferredRoot = null) {
     }
   }
   return [];
+}
+
+async function findQianwenKeywordWithNativeFind(searchTerms) {
+  const selection = window.getSelection && window.getSelection();
+  if (!selection || typeof window.find !== "function") return [];
+
+  const answerRoot = GEO_LAST_ANSWER_ELEMENT && document.body.contains(GEO_LAST_ANSWER_ELEMENT)
+    ? GEO_LAST_ANSWER_ELEMENT
+    : null;
+
+  const allTerms = uniqueList(searchTerms).filter((term) => String(term || "").trim().length >= 2);
+
+  for (const term of allTerms) {
+    selection.removeAllRanges();
+    const termStr = String(term);
+
+    for (let attempt = 0; attempt < 80; attempt++) {
+      if (attempt === 40) {
+        selection.removeAllRanges();
+        window.scrollTo({ top: 0, behavior: "instant" });
+        await waitForScrollStable(1500);
+      }
+
+      const found = window.find(termStr, false, false, true, false, true, false);
+      if (!found || selection.rangeCount === 0) break;
+
+      const range = selection.getRangeAt(0);
+      const container = range.commonAncestorContainer.nodeType === Node.TEXT_NODE
+        ? range.commonAncestorContainer.parentElement
+        : range.commonAncestorContainer;
+      if (!container) continue;
+
+      if (isIgnoredQianwenKeywordNode(container)) continue;
+
+      if (answerRoot && !answerRoot.contains(container) && !container.contains(answerRoot)) {
+        continue;
+      }
+
+      let positionedAncestor = container;
+      let isOverlay = false;
+      while (positionedAncestor && positionedAncestor !== document.body) {
+        const pos = window.getComputedStyle(positionedAncestor).position;
+        if (pos === "fixed" || pos === "sticky") { isOverlay = true; break; }
+        positionedAncestor = positionedAncestor.parentElement;
+      }
+      if (isOverlay) continue;
+
+      const rect = bestRangeRect(range);
+      if (!rect.width || !rect.height) continue;
+      if (rect.bottom <= 0 || rect.top >= window.innerHeight) continue;
+
+      scrollKeywordToCenter(range);
+      await waitForScrollStable(1800, nearestScrollableContainer(container));
+
+      const finalRect = bestRangeRect(range);
+      if (!finalRect.width || !finalRect.height) continue;
+
+      return [{
+        range,
+        node: range.startContainer,
+        keyword: termStr,
+        context: getKeywordContext(
+          range.startContainer.nodeValue || container.innerText || "",
+          0,
+          termStr.length
+        ),
+        source: "qianwen_native_find",
+      }];
+    }
+    selection.removeAllRanges();
+  }
+
+  return [];
+}
+
+let _qianwenSelectionStyleEl = null;
+
+function applyQianwenSelectionHighlight() {
+  if (_qianwenSelectionStyleEl) return;
+  const style = document.createElement("style");
+  style.id = "geo-qianwen-selection-highlight";
+  style.textContent = [
+    "::selection { background: rgba(255, 0, 0, 0.35) !important; color: inherit !important; }",
+    "::-moz-selection { background: rgba(255, 0, 0, 0.35) !important; color: inherit !important; }",
+    ".geo-qianwen-highlight { background: rgba(255, 0, 0, 0.18) !important; border: 2px solid #ff0000 !important; border-radius: 2px; }",
+  ].join("\n");
+  document.documentElement.appendChild(style);
+  _qianwenSelectionStyleEl = style;
+}
+
+function removeQianwenSelectionHighlight() {
+  if (_qianwenSelectionStyleEl) {
+    _qianwenSelectionStyleEl.remove();
+    _qianwenSelectionStyleEl = null;
+  }
+  const sel = window.getSelection && window.getSelection();
+  if (sel) sel.removeAllRanges();
 }
 
 function qianwenKeywordNodeScore(node, term) {
@@ -2336,22 +2508,24 @@ async function locateKeywordByAnswerText(answerText, keywords, judgeResult = nul
   }
 
   if (!matches.length) {
-    matches = await findKeywordWithNativeFind(searchTerms, targetRoot);
-  }
-
-  if (!matches.length) {
+    // 非千问平台禁止 window.find：浏览器会先把左侧历史栏里的同名会话
+    // 滚入视口，再由代码判断它不是正文，造成“滑的是左边框”的现象。
+    // 直接在回答根节点内做 DOM Range + 正文容器滚动。
     matches = await findKeywordMatchesByScroll(searchTerms, targetRoot);
   }
   if (!matches.length) return { matched: false };
 
   const firstMatch = matches[0];
-  const rects = await drawKeywordAndEnsureViewport(firstMatch);
-  const firstRect = document.querySelector(".geo-keyword-mark")?.getBoundingClientRect() || firstMatch.range.getBoundingClientRect();
+  await drawKeywordAndEnsureViewport(firstMatch);
+  // 返回关键词 Range 自身的坐标，不返回带 padding 的网页覆盖层坐标。
+  const exactRects = Array.from(firstMatch.range.getClientRects ? firstMatch.range.getClientRects() : [])
+    .filter((rect) => rect.width > 0 && rect.height > 0);
+  const firstRect = bestRangeRect(firstMatch.range);
 
   return {
     matched: true,
     matched_keywords: [answerHit.reportedKeyword || answerHit.keyword],
-    rects: rects.map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height })),
+    rects: exactRects.map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height })),
     first_rect: {
       x: firstRect.x,
       y: firstRect.y,
@@ -2389,19 +2563,47 @@ function keywordMarkFullyInViewport(margin = 8) {
   });
 }
 
+function keywordRectNearViewportCenter(rect, band = 0.24) {
+  if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+  const centerY = Number(rect.y !== undefined ? rect.y : rect.top) + rect.height / 2;
+  const viewportCenterY = window.innerHeight / 2;
+  return Math.abs(centerY - viewportCenterY) <= window.innerHeight * band;
+}
+
+async function centerKeywordRangePrecisely(range, attempts = 3) {
+  if (!range) return null;
+  const start = range.startContainer;
+  const element = start && start.nodeType === Node.TEXT_NODE ? start.parentElement : start;
+  if (!element || isIgnoredLocateNode(element) || isSidePanelKeywordNode(element)) return null;
+  const container = nearestScrollableContainer(range.startContainer);
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    let rect = bestRangeRect(range);
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    scrollContainerToCenter(container, rect);
+    await waitForScrollStable(900, container);
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    rect = bestRangeRect(range);
+    const fullyVisible = rect.top >= 8 && rect.left >= 8 &&
+      rect.bottom <= window.innerHeight - 8 && rect.right <= window.innerWidth - 8;
+    if (fullyVisible && keywordRectNearViewportCenter(rect)) return rect;
+  }
+  return bestRangeRect(range);
+}
+
 async function drawKeywordAndEnsureViewport(match) {
-  scrollKeywordToCenter(match.range);
-  await waitForScrollStable();
+  GEO_ACTIVE_KEYWORD_RANGE = match && match.range ? match.range : null;
+  await centerKeywordRangePrecisely(match.range, 3);
   let rects = drawDOMKeywordBoxes([match]);
-  if (!keywordMarkFullyInViewport()) {
-    scrollKeywordToCenter(match.range);
-    await waitForScrollStable();
+  const exactRect = bestRangeRect(match.range);
+  if (!keywordMarkFullyInViewport() || !keywordRectNearViewportCenter(exactRect)) {
+    await centerKeywordRangePrecisely(match.range, 3);
     rects = drawDOMKeywordBoxes([match]);
   }
   return rects;
 }
 
 async function drawKeywordAndEnsureViewportSmooth(match) {
+  GEO_ACTIVE_KEYWORD_RANGE = match && match.range ? match.range : null;
   scrollKeywordToCenter(match.range);
   await waitForScrollStable(800, nearestScrollableContainer(match.range.startContainer));
   await forceCenterQianwenMatch(match, 700);
@@ -2423,17 +2625,16 @@ async function locateAndMarkAnswerKeyword(answerText, matchedKeywords, judgeResu
   let domLocation = await locateKeywordByAnswerText(answerText, matchedKeywords, judgeResult);
   if (!domLocation.matched || !visibleKeywordMarkExists()) {
     const answerRoot = GEO_LAST_ANSWER_ELEMENT && document.body.contains(GEO_LAST_ANSWER_ELEMENT) ? GEO_LAST_ANSWER_ELEMENT : null;
-    let scrollMatches = await findKeywordWithNativeFind(matchedKeywords.slice(0, 1), answerRoot);
-    if (!scrollMatches.length) {
-      scrollMatches = await findKeywordMatchesByScroll(matchedKeywords.slice(0, 1), answerRoot);
-    }
+    const scrollMatches = await findKeywordMatchesByScroll(matchedKeywords.slice(0, 1), answerRoot);
     if (scrollMatches.length) {
-      const rects = await drawKeywordAndEnsureViewport(scrollMatches[0]);
-      const firstRect = document.querySelector(".geo-keyword-mark")?.getBoundingClientRect() || scrollMatches[0].range.getBoundingClientRect();
+      await drawKeywordAndEnsureViewport(scrollMatches[0]);
+      const exactRects = Array.from(scrollMatches[0].range.getClientRects ? scrollMatches[0].range.getClientRects() : [])
+        .filter((rect) => rect.width > 0 && rect.height > 0);
+      const firstRect = bestRangeRect(scrollMatches[0].range);
       domLocation = {
         matched: true,
         matched_keywords: [scrollMatches[0].keyword],
-        rects: rects.map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height })),
+        rects: exactRects.map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height })),
         first_rect: { x: firstRect.x, y: firstRect.y, width: firstRect.width, height: firstRect.height },
         context: scrollMatches[0].context,
         match_type: "scroll_scan",
@@ -2529,7 +2730,7 @@ async function locateAndMarkKeywordForScreenshot(platform, answerText, matchedKe
           rects: rects.map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height })),
           first_rect: { x: firstRect.x, y: firstRect.y, width: firstRect.width, height: firstRect.height },
           context: matches[0].context,
-          needs_image_annotation: true,
+          needs_image_annotation: false,
           match_type: matches[0].source || "qianwen_precise_keyword",
         };
       }
@@ -2541,12 +2742,12 @@ async function locateAndMarkKeywordForScreenshot(platform, answerText, matchedKe
           ? { x: firstRect.x, y: firstRect.y, width: firstRect.width, height: firstRect.height }
           : null,
         context: matches[0].context,
-        needs_ocr_annotation: true,
+        needs_image_annotation: true,
         match_type: "qianwen_keyword_scrolled_for_ocr",
       };
     }
     clearKeywordMarks();
-    return { matched: false, needs_ocr_annotation: true, match_type: "qianwen_keyword_not_visible" };
+    return { matched: false, needs_image_annotation: true, match_type: "qianwen_keyword_not_visible" };
   }
 
   return locateAndMarkAnswerKeyword(answerText, matchedKeywords, judgeResult);
@@ -2565,7 +2766,9 @@ async function captureVisibleScreenshot() {
 }
 
 async function annotateScreenshotDataUrl(dataUrl, rect) {
-  if (!dataUrl || !rect || rect.width <= 0 || rect.height <= 0) return dataUrl;
+  const inputRects = (Array.isArray(rect) ? rect : [rect])
+    .filter((item) => item && item.width > 0 && item.height > 0);
+  if (!dataUrl || !inputRects.length) return dataUrl;
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
@@ -2577,16 +2780,17 @@ async function annotateScreenshotDataUrl(dataUrl, rect) {
 
       const scaleX = canvas.width / window.innerWidth;
       const scaleY = canvas.height / window.innerHeight;
-      const left = Math.max(8, rect.x - 10) * scaleX;
-      const top = Math.max(8, rect.y - 10) * scaleY;
-      const right = Math.min(window.innerWidth - 8, rect.x + rect.width + 10) * scaleX;
-      const bottom = Math.min(window.innerHeight - 8, rect.y + rect.height + 10) * scaleY;
-
       ctx.lineWidth = Math.max(4, Math.round(4 * Math.min(scaleX, scaleY)));
       ctx.strokeStyle = "#ff0000";
       ctx.fillStyle = "rgba(255, 0, 0, 0.06)";
-      ctx.fillRect(left, top, Math.max(24, right - left), Math.max(20, bottom - top));
-      ctx.strokeRect(left, top, Math.max(24, right - left), Math.max(20, bottom - top));
+      for (const item of inputRects.slice(0, 3)) {
+        const left = Math.max(8, item.x - 4) * scaleX;
+        const top = Math.max(8, item.y - 4) * scaleY;
+        const right = Math.min(window.innerWidth - 8, item.x + item.width + 4) * scaleX;
+        const bottom = Math.min(window.innerHeight - 8, item.y + item.height + 4) * scaleY;
+        ctx.fillRect(left, top, Math.max(24, right - left), Math.max(20, bottom - top));
+        ctx.strokeRect(left, top, Math.max(24, right - left), Math.max(20, bottom - top));
+      }
       resolve(canvas.toDataURL("image/png"));
     };
     img.onerror = () => resolve(dataUrl);
@@ -2600,6 +2804,39 @@ async function prepareForScreenshot() {
   const activeEl = document.activeElement;
   if (activeEl) activeEl.blur();
   await sleep(300);
+}
+
+async function waitForKeywordRectStable(range, timeoutMs = 1800) {
+  if (!range) return null;
+  const started = Date.now();
+  let last = null;
+  let stableCount = 0;
+  while (Date.now() - started < timeoutMs) {
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    await sleep(80);
+    let rect = null;
+    try {
+      rect = bestRangeRect(range);
+    } catch (_) {
+      return null;
+    }
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    const current = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    if (
+      last &&
+      Math.abs(current.x - last.x) < 1 &&
+      Math.abs(current.y - last.y) < 1 &&
+      Math.abs(current.width - last.width) < 1 &&
+      Math.abs(current.height - last.height) < 1
+    ) {
+      stableCount++;
+      if (stableCount >= 3) return current;
+    } else {
+      stableCount = 0;
+    }
+    last = current;
+  }
+  return last;
 }
 
 function cleanupAfterScreenshot() {
@@ -2764,6 +3001,7 @@ async function judgeAnswer(answerText, keywords, task) {
 async function runPlatformTask(task) {
   clearKeywordMarks();
   clearMatchedBadges();
+  GEO_ACTIVE_KEYWORD_RANGE = null;
   let answerText = "";
   let matched = false;
   let matchedKeywords = [];
@@ -2866,8 +3104,13 @@ async function runPlatformTask(task) {
       if (domLocation && domLocation.matched && visibleKeywordMarkExists() && keywordMarkFullyInViewport()) break;
 
       clearKeywordMarks();
-      // 先滚动到关键词位置；千问不要把整页回答容器滚回顶部，优先保持关键词搜索滚动结果。
-      if (task.platform !== "qianwen" && GEO_LAST_ANSWER_ELEMENT && document.body.contains(GEO_LAST_ANSWER_ELEMENT)) {
+      // 先滚动到关键词位置；千问也滚动到回答区域，确保虚拟滚动加载内容。
+      if (
+        GEO_LAST_ANSWER_ELEMENT &&
+        document.body.contains(GEO_LAST_ANSWER_ELEMENT) &&
+        !isIgnoredLocateNode(GEO_LAST_ANSWER_ELEMENT) &&
+        !isSidePanelKeywordNode(GEO_LAST_ANSWER_ELEMENT)
+      ) {
         GEO_LAST_ANSWER_ELEMENT.scrollIntoView({ block: "center", behavior: "instant" });
         await waitForScrollStable(2000);
       }
@@ -2883,10 +3126,12 @@ async function runPlatformTask(task) {
         if (task.platform === "qianwen") {
           scrollMatches = await findQianwenKeywordMatchesByScroll(keywordSearchTerms(matchedKeywords, judgeResult, keywords));
         } else {
-          scrollMatches = await findKeywordWithNativeFind(matchedKeywords.slice(0, 1), null);
-          if (!scrollMatches.length) {
-            scrollMatches = await findKeywordMatchesByScroll(matchedKeywords.slice(0, 1), null);
-          }
+          const answerRoot = GEO_LAST_ANSWER_ELEMENT && document.body.contains(GEO_LAST_ANSWER_ELEMENT)
+            ? GEO_LAST_ANSWER_ELEMENT
+            : null;
+          const exactTerms = keywordSearchTerms(matchedKeywords, judgeResult, keywords)
+            .sort((left, right) => normalizeKeywordText(right).length - normalizeKeywordText(left).length);
+          scrollMatches = await findKeywordMatchesByScroll(exactTerms, answerRoot);
         }
         if (scrollMatches.length) {
           const rects = task.platform === "qianwen"
@@ -2901,7 +3146,7 @@ async function runPlatformTask(task) {
               matched_keywords: [scrollMatches[0].keyword],
               rects: rects.map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height })),
               first_rect: { x: firstRect.x, y: firstRect.y, width: firstRect.width, height: firstRect.height },
-              needs_image_annotation: task.platform === "qianwen",
+              needs_image_annotation: false,
               match_type: task.platform === "qianwen" ? "qianwen_precise_keyword_scroll" : "scroll_fallback",
             };
           }
@@ -2914,9 +3159,9 @@ async function runPlatformTask(task) {
     await sleep(task.platform === "qianwen" ? 300 : 500);
 
     // 如果网页层红框还是不可见，保留 domLocation，后面截图后会直接在图片上补框。
-    const imageFallbackRect = domLocation && domLocation.first_rect
+    const imageFallbackRect = domLocation && domLocation.matched && domLocation.first_rect
       ? domLocation.first_rect
-      : (task.platform === "qianwen" ? null : fallbackAnswerRect());
+      : null;
     if (!visibleKeywordMarkExists() || !keywordMarkFullyInViewport()) {
       clearKeywordMarks();
       if (imageFallbackRect) {
@@ -2926,25 +3171,37 @@ async function runPlatformTask(task) {
           matched_keywords: matchedKeywords,
           first_rect: imageFallbackRect,
           needs_image_annotation: true,
-          match_type: domLocation && domLocation.match_type ? domLocation.match_type : "answer_area_fallback",
+          match_type: domLocation && domLocation.match_type ? domLocation.match_type : "exact_keyword_canvas_fallback",
+        };
+      } else {
+        domLocation = {
+          matched: false,
+          matched_keywords: matchedKeywords,
+          first_rect: null,
+          needs_image_annotation: false,
+          match_type: "exact_keyword_not_found_no_box",
         };
       }
     }
   } else {
     clearKeywordMarks();
-    if (GEO_LAST_ANSWER_ELEMENT && document.body.contains(GEO_LAST_ANSWER_ELEMENT)) {
+    if (
+      GEO_LAST_ANSWER_ELEMENT &&
+      document.body.contains(GEO_LAST_ANSWER_ELEMENT) &&
+      !isIgnoredLocateNode(GEO_LAST_ANSWER_ELEMENT) &&
+      !isSidePanelKeywordNode(GEO_LAST_ANSWER_ELEMENT)
+    ) {
       GEO_LAST_ANSWER_ELEMENT.scrollIntoView({ block: "center", behavior: "smooth" });
       await waitForScrollStable();
     }
   }
 
   const shouldAnnotateImage = matched && domLocation && domLocation.first_rect && (
-    task.platform === "qianwen" ||
     domLocation.needs_image_annotation ||
     !visibleKeywordMarkExists() ||
     !keywordMarkFullyInViewport()
   );
-  const annotationRect = shouldAnnotateImage ? domLocation.first_rect : null;
+  let annotationRect = shouldAnnotateImage ? domLocation.first_rect : null;
 
   if (domLocation && domLocation.matched) {
     domLocation.screenshot_viewport = {
@@ -2955,6 +3212,28 @@ async function runPlatformTask(task) {
   }
 
   await prepareForScreenshot();
+  // 失焦、懒加载、吸顶栏和虚拟列表都可能在滚动结束后再次改变正文位置。
+  // 截图前必须以仍然存活的 Range 重新测量并重画，不能沿用滚动前坐标。
+  if (matched && GEO_ACTIVE_KEYWORD_RANGE && domLocation && domLocation.matched) {
+    const latestRect = await waitForKeywordRectStable(GEO_ACTIVE_KEYWORD_RANGE);
+    if (
+      latestRect && latestRect.x >= 0 && latestRect.y >= 0 &&
+      latestRect.x + latestRect.width <= window.innerWidth &&
+      latestRect.y + latestRect.height <= window.innerHeight
+    ) {
+      clearKeywordMarks();
+      drawBoxFromRect(latestRect, 4);
+      domLocation.first_rect = { ...latestRect };
+      domLocation.rects = [{ ...latestRect }];
+      if (shouldAnnotateImage) annotationRect = { ...latestRect };
+      domLocation.screenshot_viewport = {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        device_pixel_ratio: window.devicePixelRatio || 1,
+      };
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    }
+  }
   screenshotDataUrl = await captureVisibleScreenshot();
   cleanupAfterScreenshot();
   if (shouldAnnotateImage && screenshotDataUrl) {

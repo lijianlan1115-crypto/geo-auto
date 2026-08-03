@@ -3,9 +3,111 @@ let activeCount = 0;
 let pumpActive = false;
 let currentServerUrl = "http://127.0.0.1:8765";
 let currentConcurrency = 3;
+const RUN_STATE_KEY = "geoAutomationRunning";
+const PUMP_ALARM_NAME = "geo-automation-pump";
+const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 
-const CONTENT_SCRIPTS = ["content_script.js", "content_script_geo_patch.js", "content_script_platform_patch.js"];
+const CONTENT_SCRIPTS = [
+  "content_script.js",
+  "content_script_geo_patch.js",
+  "content_script_platform_patch.js",
+  "content_script_qianwen_screenshot_patch.js",
+];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const lastDispatchByPlatform = {};
+const DEFAULT_RATE_LIMIT = {
+  enabled: true,
+  minDelaySec: 30,
+  maxDelaySec: 90,
+  samePlatformExtraSec: 15,
+};
+
+async function getRateLimitConfig() {
+  const data = await chrome.storage.local.get(["rateLimit"]);
+  const stored = data.rateLimit || {};
+  return {
+    enabled: stored.enabled !== undefined ? stored.enabled : DEFAULT_RATE_LIMIT.enabled,
+    minDelaySec: stored.minDelaySec || DEFAULT_RATE_LIMIT.minDelaySec,
+    maxDelaySec: stored.maxDelaySec || DEFAULT_RATE_LIMIT.maxDelaySec,
+    samePlatformExtraSec: stored.samePlatformExtraSec || DEFAULT_RATE_LIMIT.samePlatformExtraSec,
+  };
+}
+
+async function waitForPlatformCooldown(platform) {
+  const config = await getRateLimitConfig();
+  if (!config.enabled) return;
+  const lastTime = lastDispatchByPlatform[platform] || 0;
+  const now = Date.now();
+  const elapsed = now - lastTime;
+  const baseDelay = config.minDelaySec * 1000 + Math.random() * (config.maxDelaySec - config.minDelaySec) * 1000;
+  const extraDelay = config.samePlatformExtraSec * 1000;
+  const requiredDelay = baseDelay + extraDelay;
+  if (elapsed < requiredDelay) {
+    const waitMs = requiredDelay - elapsed;
+    const waitSec = Math.round(waitMs / 1000);
+    console.log(`[RATE-LIMIT] ${platform} cooling down, waiting ${waitSec}s...`);
+    try { chrome.runtime.sendMessage({ action: "STATUS_UPDATE", message: `等待 ${waitSec}s 再提问（防封号）...` }).catch(() => {}); } catch (e) {}
+    const startTime = Date.now();
+    while (Date.now() - startTime < waitMs) {
+      if (!running) return;
+      await sleep(1000);
+      // MV3 Service Worker 在长时间纯定时等待时会被休眠。周期性调用
+      // Chrome API 保持调度事件活跃，避免跑到一半丢失内存运行状态。
+      if (Math.floor((Date.now() - startTime) / 1000) % 10 === 0) {
+        await chrome.runtime.getPlatformInfo().catch(() => null);
+      }
+    }
+  }
+}
+
+async function setPersistentRunning(value) {
+  running = Boolean(value);
+  await chrome.storage.local.set({ [RUN_STATE_KEY]: running });
+  if (running) {
+    await chrome.alarms.create(PUMP_ALARM_NAME, { periodInMinutes: 0.5 });
+    await ensureOffscreenKeepalive().catch(() => null);
+  } else {
+    await chrome.alarms.clear(PUMP_ALARM_NAME).catch(() => false);
+    await closeOffscreenKeepalive().catch(() => null);
+  }
+}
+
+async function ensureOffscreenKeepalive() {
+  if (!chrome.offscreen || typeof chrome.offscreen.createDocument !== "function") return false;
+  const offscreenUrl = chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH);
+  if (typeof chrome.runtime.getContexts === "function") {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ["OFFSCREEN_DOCUMENT"],
+      documentUrls: [offscreenUrl],
+    });
+    if (contexts && contexts.length) return true;
+  }
+  try {
+    await chrome.offscreen.createDocument({
+      url: OFFSCREEN_DOCUMENT_PATH,
+      reasons: ["WORKERS"],
+      justification: "保持批量GEO任务调度，防止Chrome后台在任务中途休眠",
+    });
+    return true;
+  } catch (error) {
+    // 文档已存在时 createDocument 会报错，可视为保活已启用。
+    return /already exists|single offscreen/i.test(String(error && error.message ? error.message : error));
+  }
+}
+
+async function closeOffscreenKeepalive() {
+  if (!chrome.offscreen || typeof chrome.offscreen.closeDocument !== "function") return;
+  await chrome.offscreen.closeDocument().catch(() => null);
+}
+
+async function resumePumpFromPersistentState() {
+  const stored = await chrome.storage.local.get([RUN_STATE_KEY]);
+  if (!stored[RUN_STATE_KEY]) return;
+  await mergedSettingsFromStorage().catch(() => null);
+  running = true;
+  pump();
+}
 
 function splitKeywords(value) {
   if (Array.isArray(value)) return value.map((item) => String(item || "").trim()).filter(Boolean);
@@ -41,6 +143,17 @@ async function api(path, options = {}) {
       error: `连接不上 Python 服务：${currentServerUrl}。请先启动 python_service/server.py，再点“检查服务”。原始错误：${String(error && error.message ? error.message : error)}`,
     };
   }
+}
+
+async function apiWithRetry(path, options = {}, attempts = 5) {
+  let lastResult = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    lastResult = await api(path, options);
+    if (lastResult && lastResult.ok) return lastResult;
+    await sleep(Math.min(5000, 800 * (attempt + 1)));
+    await chrome.runtime.getPlatformInfo().catch(() => null);
+  }
+  return lastResult || { ok: false, error: `${path} 多次重试仍未成功` };
 }
 
 async function waitForTabLoaded(tabId, timeoutMs = 60000) {
@@ -149,7 +262,7 @@ async function runOneTask(task) {
       throw err;
     }
 
-    await api("/submit-result", {
+    const submitted = await apiWithRetry("/submit-result", {
       method: "POST",
       body: JSON.stringify({
         task_id: task.task_id,
@@ -169,6 +282,9 @@ async function runOneTask(task) {
         keywords: task.keywords,
       }),
     });
+    if (!submitted || !submitted.ok) {
+      throw new Error(submitted && submitted.error ? submitted.error : "结果回传失败");
+    }
   } catch (error) {
     if (
       task.platform === "wenxin" &&
@@ -180,7 +296,7 @@ async function runOneTask(task) {
     if (tab && tab.windowId) {
       const fallbackScreenshot = await captureTabScreenshot(tab.windowId).catch(() => null);
       if (fallbackScreenshot) {
-        const submitted = await api("/submit-result", {
+        const submitted = await apiWithRetry("/submit-result", {
           method: "POST",
           body: JSON.stringify({
             task_id: task.task_id,
@@ -204,7 +320,7 @@ async function runOneTask(task) {
       }
     }
     if (fallbackSubmitted) return;
-    await api("/task-failed", {
+    await apiWithRetry("/task-failed", {
       method: "POST",
       body: JSON.stringify({
         task_id: task.task_id,
@@ -408,25 +524,46 @@ async function pump() {
         continue;
       }
 
-      const data = await api("/next-task");
-      if (!data.ok) {
-        running = false;
-        return;
+      // 先查看平台并完成限流等待，再正式领取任务。以前先领取再等待，
+      // Service Worker 在等待期间被挂起时会遗留永久 running 任务。
+      const preview = await api("/peek-task");
+      if (!preview.ok) {
+        await sleep(2000);
+        continue;
       }
-      if (!data.task) {
+      if (!preview.task) {
         if (activeCount > 0) {
           await sleep(100);
           continue;
         }
         // All windows have finished. Persist the final workbook first, then let
         // the service clear this batch's temporary SQLite task records.
-        await api("/finalize-batch", {
+        const finalized = await api("/finalize-batch", {
           method: "POST",
           body: JSON.stringify({}),
         }).catch(() => {});
-        running = false;
-        return;
+        if (finalized && finalized.ok) {
+          await setPersistentRunning(false);
+          return;
+        }
+        // 仍有尚未回传的 running 任务时保持调度器存活，等待其完成；
+        // 不再把一次暂时无法收尾误判成整批结束。
+        await sleep(2000);
+        continue;
       }
+
+      await waitForPlatformCooldown(preview.task.platform);
+      if (!running) return;
+
+      const data = await api("/next-task");
+      if (!data.ok) {
+        await sleep(2000);
+        continue;
+      }
+      // 预览后任务可能已被别的执行器领取，重新进入循环即可。
+      if (!data.task) continue;
+
+      lastDispatchByPlatform[data.task.platform] = Date.now();
       activeCount += 1;
       void runOneTask(data.task);
       await sleep(50);
@@ -435,6 +572,16 @@ async function pump() {
     pumpActive = false;
   }
 }
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm && alarm.name === PUMP_ALARM_NAME) {
+    void resumePumpFromPersistentState();
+  }
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  void resumePumpFromPersistentState();
+});
 
 async function syncRunConfig(platforms, aiJudge) {
   if (platforms && platforms.length) {
@@ -455,7 +602,7 @@ async function syncRunConfig(platforms, aiJudge) {
 }
 
 async function mergedSettingsFromStorage() {
-  const data = await chrome.storage.local.get(["serverUrl", "concurrency", "platformUrls", "platforms", "keyword", "aiJudge"]);
+  const data = await chrome.storage.local.get(["serverUrl", "concurrency", "platformUrls", "platforms", "keyword", "aiJudge", "rateLimit"]);
   currentServerUrl = data.serverUrl || currentServerUrl;
   const storedAiJudge = data.aiJudge || {};
   const serverAiJudge = await api("/ai-judge-config").catch(() => null);
@@ -470,11 +617,21 @@ async function mergedSettingsFromStorage() {
     } : {}),
     api_key: storedAiJudge.api_key || "",
   };
-  return { data, aiJudge };
+  const rateLimit = data.rateLimit || { enabled: true, minDelaySec: 30, maxDelaySec: 90, samePlatformExtraSec: 15 };
+  return { data, aiJudge, rateLimit };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
+    if (message.action === "GEO_KEEPALIVE") {
+      const stored = await chrome.storage.local.get([RUN_STATE_KEY]);
+      if (stored[RUN_STATE_KEY]) {
+        running = true;
+        pump();
+      }
+      sendResponse({ ok: true, running: Boolean(stored[RUN_STATE_KEY]) });
+      return;
+    }
     if (message.action === "CAPTURE_TAB") {
       if (!sender.tab || !sender.tab.windowId) {
         sendResponse({ ok: false, error: "找不到窗口" });
@@ -658,6 +815,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         platformUrls: data.platformUrls || {},
         platforms: data.platforms || [],
         aiJudge,
+        rateLimit: data.rateLimit || { enabled: true, minDelaySec: 30, maxDelaySec: 90, samePlatformExtraSec: 15 },
       });
       return;
     }
@@ -679,6 +837,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         platformUrls: message.platformUrls || {},
         platforms: message.platforms || [],
         aiJudge: nextAiJudge,
+        rateLimit: message.rateLimit || { enabled: true, minDelaySec: 30, maxDelaySec: 90, samePlatformExtraSec: 15 },
       });
       const synced = await syncRunConfig(message.platforms || [], message.aiJudge ? { ...message.aiJudge, api_key: message.aiJudge.api_key || "" } : undefined).catch((error) => ({
         ok: false,
@@ -756,7 +915,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
         return;
       }
-      running = true;
+      await setPersistentRunning(true);
       const targetWarmup = await prewarmTargetContexts(message.platforms || []).catch((error) => ({
         groups: 0,
         attempted: 0,
@@ -786,6 +945,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
+    if (message.action === "RESET_QIANWEN_UNMATCHED") {
+      sendResponse(await api("/reset-unmatched-tasks", {
+        method: "POST",
+        body: JSON.stringify({ platform: "qianwen" }),
+      }));
+      return;
+    }
+
     if (message.action === "RESET_ALL_TASKS") {
       sendResponse(await api("/reset-all-tasks", { method: "POST", body: JSON.stringify({}) }));
       return;
@@ -797,7 +964,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.action === "STOP") {
-      running = false;
+      await setPersistentRunning(false);
       const syncResult = await api("/sync-results", {
         method: "POST",
         body: JSON.stringify({ reason: "manual_stop" }),

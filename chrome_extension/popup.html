@@ -26,6 +26,19 @@
     <input id="serverUrl" value="http://127.0.0.1:8765">
     <label>并发数</label>
     <input id="concurrency" type="number" min="1" max="5" value="3">
+    <label class="inline"><input id="rateLimitEnabled" type="checkbox" checked>启用防封延迟（问题间随机等待）</label>
+    <div style="display:flex;gap:8px;">
+      <div style="flex:1;">
+        <label>最小间隔（秒）</label>
+        <input id="rateLimitMin" type="number" min="5" max="600" value="30">
+      </div>
+      <div style="flex:1;">
+        <label>最大间隔（秒）</label>
+        <input id="rateLimitMax" type="number" min="10" max="1200" value="90">
+      </div>
+    </div>
+    <label>同平台额外等待（秒，不同平台间不额外等待）</label>
+    <input id="rateLimitExtra" type="number" min="0" max="300" value="15">
     <label>目标关键词（多个用逗号/顿号/or分隔）</label>
     <input id="keyword" placeholder="例如：目标品牌A、某某酒店、某某学校">
     <label class="inline"><input id="aiJudgeEnabled" type="checkbox">启用内部 AI 判定</label>
@@ -65,6 +78,9 @@
     <div class="row">
       <button id="resetFailed" class="secondary">重置失败任务</button>
       <button id="resetAll" class="danger">重置所有任务</button>
+    </div>
+    <div class="row">
+      <button id="resetQianwenUnmatched" class="secondary">仅重跑千问未命中</button>
     </div>
     <label>状态</label>
     <pre id="log">等待操作</pre>

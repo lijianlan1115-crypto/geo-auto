@@ -4,13 +4,42 @@
 当浏览器 DOM 定位失败时，使用 Tesseract OCR 对截图进行二次检测。
 """
 
+import os
 import re
+import shutil
+import sys
+from pathlib import Path
 
 
 def normalize_text(text):
     if not text:
         return ""
     return re.sub(r"\s+|[，。！？、,.!?]", "", str(text)).lower()
+
+
+def configure_tesseract_runtime(pytesseract):
+    """优先使用客户包内置的 Tesseract，兼容 Windows 无独立安装环境。"""
+    executable_dir = (
+        Path(sys.executable).resolve().parent
+        if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parent
+    )
+    configured = str(os.getenv("GEO_TESSERACT_CMD", "") or "").strip()
+    candidates = [
+        Path(configured).expanduser() if configured else None,
+        executable_dir / "Tesseract-OCR" / "tesseract.exe",
+        executable_dir.parent / "Tesseract-OCR" / "tesseract.exe",
+        Path(shutil.which("tesseract") or "") if shutil.which("tesseract") else None,
+    ]
+    for candidate in candidates:
+        if not candidate or not candidate.is_file():
+            continue
+        pytesseract.pytesseract.tesseract_cmd = str(candidate)
+        tessdata = candidate.parent / "tessdata"
+        if tessdata.is_dir():
+            os.environ.setdefault("TESSDATA_PREFIX", str(tessdata))
+        return str(candidate)
+    return ""
 
 
 def expand_bbox_to_text_line(items, bbox):
@@ -44,6 +73,8 @@ def check_keyword(image_path, keywords, region_ratio=None):
             "matched": False,
             "error": "未安装 pytesseract 或 Pillow"
         }
+
+    tesseract_cmd = configure_tesseract_runtime(pytesseract)
 
     raw_keywords = keywords if isinstance(keywords, list) else [keywords]
     keyword_items = [
@@ -96,7 +127,7 @@ def check_keyword(image_path, keywords, region_ratio=None):
                     return {
                         "matched": True,
                         "keyword": keyword["raw"],
-                        "bbox": expand_bbox_to_text_line(ocr_items, item["bbox"])
+                        "bbox": item["bbox"]
                     }
 
         # 合并相邻 OCR 文字，处理关键词被拆开的情况
@@ -116,12 +147,13 @@ def check_keyword(image_path, keywords, region_ratio=None):
                         return {
                             "matched": True,
                             "keyword": keyword["raw"],
-                            "bbox": expand_bbox_to_text_line(ocr_items, [min(xs), min(ys), max(xs), max(ys)])
+                            "bbox": [min(xs), min(ys), max(xs), max(ys)]
                         }
 
         return {"matched": False}
     except Exception as e:
         return {
             "matched": False,
-            "error": str(e)
+            "error": str(e),
+            "tesseract_cmd": tesseract_cmd,
         }

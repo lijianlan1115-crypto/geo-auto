@@ -1,13 +1,18 @@
 import base64
+import io
 import json
 import os
+import posixpath
 import re
 import shutil
 import sqlite3
+import struct
 import threading
 import time
 import uuid
 import zipfile
+import copy
+import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,9 +47,10 @@ from config import (
 )
 
 from ocr_checker import check_keyword
-from image_marker import mark_image
+from image_marker import image_has_red_box, mark_image
 from ai_judge import (
     ai_judge,
+    clear_target_research_cache,
     configure_ai_judge,
     generate_followup,
     get_ai_judge_config,
@@ -66,6 +72,7 @@ lock = threading.RLock()
 TARGET_PLATFORM_CONTEXT_PATH = OUTPUT_DIR / "target_platform_context_cache.json"
 LAST_SYNC_ERROR = ""
 LAST_SYNC_WARNING = ""
+RERUN_UNMATCHED_STATE_KEY = "rerun_unmatched_platforms"
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -99,6 +106,7 @@ def validate_workbook_file(path):
             damaged_entry = archive.testzip()
             if damaged_entry:
                 raise ValueError(f"Excel 压缩内容损坏：{damaged_entry}")
+            _validate_dispimg_resources(archive, names)
     except (OSError, zipfile.BadZipFile) as exc:
         raise ValueError(f"Excel 文件结构损坏：{workbook_path}") from exc
 
@@ -149,9 +157,530 @@ def preserve_last_good_workbook(target):
             pending_backup.unlink()
 
 
-def save_workbook_atomic(workbook, target_path):
+_OOXML_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_OOXML_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_OOXML_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_OOXML_CONTENT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+_OOXML_DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+_OOXML_DRAWING_MAIN_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_WPS_CELL_IMAGE_NS = "http://www.wps.cn/officeDocument/2017/etCustomData"
+_WPS_CELL_IMAGE_REL_TYPE = "http://www.wps.cn/officeDocument/2020/cellImage"
+_WPS_CELL_IMAGE_CONTENT_TYPE = "application/vnd.wps-officedocument.cellimage+xml"
+
+
+def _validate_dispimg_resources(archive, names=None):
+    """拒绝只有 DISPIMG 公式、没有实际媒体资源的伪内嵌结果表。"""
+    names = set(names or archive.namelist())
+    formula_ids = set()
+    for worksheet_part in sorted(
+        name for name in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)
+    ):
+        root = ET.fromstring(archive.read(worksheet_part))
+        for cell in root.findall(f".//{{{_OOXML_MAIN_NS}}}c"):
+            formula = cell.find(f"{{{_OOXML_MAIN_NS}}}f")
+            value = cell.find(f"{{{_OOXML_MAIN_NS}}}v")
+            text = " ".join(
+                item for item in (
+                    formula.text if formula is not None else "",
+                    value.text if value is not None else "",
+                ) if item
+            )
+            match = re.search(r'DISPIMG\("([^"]+)"', text, flags=re.I)
+            if match:
+                formula_ids.add(match.group(1))
+
+    if not formula_ids:
+        return
+
+    cell_images_part = "xl/cellimages.xml"
+    rels_part = "xl/_rels/cellimages.xml.rels"
+    missing_parts = {cell_images_part, rels_part} - names
+    if missing_parts:
+        raise ValueError(
+            "Excel 含 DISPIMG 公式但缺少内嵌图片资源："
+            f"{sorted(missing_parts)}"
+        )
+
+    relationships = ET.fromstring(archive.read(rels_part))
+    targets = {
+        item.get("Id"): _resolve_ooxml_target(cell_images_part, item.get("Target", ""))
+        for item in relationships.findall(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship")
+        if str(item.get("Type", "")).endswith("/image")
+    }
+    cell_images = ET.fromstring(archive.read(cell_images_part))
+    resource_ids = set()
+    for cell_image in cell_images.findall(f"{{{_WPS_CELL_IMAGE_NS}}}cellImage"):
+        picture = cell_image.find(f"{{{_OOXML_DRAWING_NS}}}pic")
+        if picture is None:
+            continue
+        non_visual = picture.find(f".//{{{_OOXML_DRAWING_NS}}}cNvPr")
+        blip = picture.find(f".//{{{_OOXML_DRAWING_MAIN_NS}}}blip")
+        image_id = non_visual.get("name", "") if non_visual is not None else ""
+        relation_id = blip.get(f"{{{_OOXML_REL_NS}}}embed", "") if blip is not None else ""
+        media_part = targets.get(relation_id, "")
+        if image_id and media_part in names and len(archive.read(media_part)) > 0:
+            resource_ids.add(image_id)
+
+    missing_ids = formula_ids - resource_ids
+    if missing_ids:
+        preview = "、".join(sorted(missing_ids)[:5])
+        raise ValueError(
+            f"Excel 有 {len(missing_ids)} 个图片公式没有对应媒体资源：{preview}"
+        )
+
+
+def _xlsx_column_name(index):
+    """把从 1 开始的列序号转换成 Excel 列名。"""
+    result = ""
+    value = int(index)
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _xml_bytes(root, default_namespace=None):
+    if default_namespace:
+        ET.register_namespace("", default_namespace)
+    ET.register_namespace("r", _OOXML_REL_NS)
+    ET.register_namespace("xdr", _OOXML_DRAWING_NS)
+    ET.register_namespace("a", _OOXML_DRAWING_MAIN_NS)
+    ET.register_namespace("etc", _WPS_CELL_IMAGE_NS)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _next_relationship_id(relationships_root):
+    used = {
+        item.get("Id")
+        for item in relationships_root.findall(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship")
+    }
+    number = 1
+    while f"rId{number}" in used:
+        number += 1
+    return f"rId{number}"
+
+
+def _cell_reference_coordinates(reference):
+    match = re.fullmatch(r"([A-Z]+)(\d+)", str(reference or "").upper())
+    if not match:
+        return None
+    column = 0
+    for char in match.group(1):
+        column = column * 26 + ord(char) - 64
+    return int(match.group(2)), column
+
+
+def embedded_cell_images(workbook_path):
+    """读取 WPS DISPIMG 单元格与其内嵌图片字节，不依赖外部截图文件。"""
+    path = Path(workbook_path)
+    if not path.exists() or not zipfile.is_zipfile(path):
+        return {}
+
+    workbook = load_workbook(path, read_only=False, data_only=False, keep_links=False)
+    try:
+        question_sheet_name = find_question_worksheet(workbook).title
+    finally:
+        workbook.close()
+
+    with zipfile.ZipFile(path, "r") as source:
+        parts = {name: source.read(name) for name in source.namelist() if not name.endswith("/")}
+
+    cell_images_part = "xl/cellimages.xml"
+    cell_images_rels_part = "xl/_rels/cellimages.xml.rels"
+    if cell_images_part not in parts or cell_images_rels_part not in parts:
+        return {}
+
+    cell_images_root = ET.fromstring(parts[cell_images_part])
+    cell_images_rels = ET.fromstring(parts[cell_images_rels_part])
+    media_by_relation = {
+        item.get("Id"): _resolve_ooxml_target(cell_images_part, item.get("Target", ""))
+        for item in cell_images_rels.findall(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship")
+        if str(item.get("Type", "")).endswith("/image")
+    }
+    image_bytes_by_id = {}
+    for cell_image in cell_images_root.findall(f"{{{_WPS_CELL_IMAGE_NS}}}cellImage"):
+        picture = cell_image.find(f"{{{_OOXML_DRAWING_NS}}}pic")
+        if picture is None:
+            continue
+        non_visual = picture.find(f".//{{{_OOXML_DRAWING_NS}}}cNvPr")
+        blip = picture.find(f".//{{{_OOXML_DRAWING_MAIN_NS}}}blip")
+        image_id = str(non_visual.get("name") or "") if non_visual is not None else ""
+        relation_id = blip.get(f"{{{_OOXML_REL_NS}}}embed") if blip is not None else ""
+        media_part = media_by_relation.get(relation_id)
+        if image_id and media_part in parts:
+            image_bytes_by_id[image_id] = parts[media_part]
+
+    workbook_root = ET.fromstring(parts["xl/workbook.xml"])
+    workbook_rels = ET.fromstring(parts["xl/_rels/workbook.xml.rels"])
+    part_by_relation = {
+        item.get("Id"): _resolve_ooxml_target("xl/workbook.xml", item.get("Target", ""))
+        for item in workbook_rels.findall(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship")
+    }
+    worksheet_part = ""
+    for sheet in workbook_root.findall(f".//{{{_OOXML_MAIN_NS}}}sheet"):
+        if sheet.get("name") == question_sheet_name:
+            worksheet_part = part_by_relation.get(sheet.get(f"{{{_OOXML_REL_NS}}}id"), "")
+            break
+    if not worksheet_part or worksheet_part not in parts:
+        return {}
+
+    result = {}
+    sheet_root = ET.fromstring(parts[worksheet_part])
+    for cell in sheet_root.findall(f".//{{{_OOXML_MAIN_NS}}}c"):
+        formula = cell.find(f"{{{_OOXML_MAIN_NS}}}f")
+        value = cell.find(f"{{{_OOXML_MAIN_NS}}}v")
+        formula_text = " ".join(
+            item for item in (
+                formula.text if formula is not None else "",
+                value.text if value is not None else "",
+            ) if item
+        )
+        image_match = re.search(r'DISPIMG\("([^"]+)"', formula_text, flags=re.I)
+        coordinates = _cell_reference_coordinates(cell.get("r"))
+        if image_match and coordinates and image_match.group(1) in image_bytes_by_id:
+            result[coordinates] = image_bytes_by_id[image_match.group(1)]
+    return result
+
+
+def _resolve_ooxml_target(source_part, target):
+    """把 relationship Target 解析成 ZIP 内部的规范相对路径。"""
+    raw_target = str(target or "")
+    if raw_target.startswith("/"):
+        return posixpath.normpath(raw_target.lstrip("/"))
+    return posixpath.normpath(
+        posixpath.join(posixpath.dirname(source_part), raw_target)
+    )
+
+
+def _set_dispimg_formula(sheet_root, row_index, column_index, image_id):
+    sheet_data = sheet_root.find(f"{{{_OOXML_MAIN_NS}}}sheetData")
+    if sheet_data is None:
+        raise ValueError("工作表缺少 sheetData，无法嵌入截图")
+
+    row_number = int(row_index) + 1
+    column_number = int(column_index) + 1
+    cell_reference = f"{_xlsx_column_name(column_number)}{row_number}"
+    row_node = next(
+        (
+            row
+            for row in sheet_data.findall(f"{{{_OOXML_MAIN_NS}}}row")
+            if int(row.get("r", 0)) == row_number
+        ),
+        None,
+    )
+    if row_node is None:
+        row_node = ET.SubElement(sheet_data, f"{{{_OOXML_MAIN_NS}}}row", {"r": str(row_number)})
+
+    cell_node = next(
+        (
+            cell
+            for cell in row_node.findall(f"{{{_OOXML_MAIN_NS}}}c")
+            if cell.get("r") == cell_reference
+        ),
+        None,
+    )
+    if cell_node is None:
+        cell_node = ET.Element(f"{{{_OOXML_MAIN_NS}}}c", {"r": cell_reference})
+        inserted = False
+        for position, existing in enumerate(row_node.findall(f"{{{_OOXML_MAIN_NS}}}c")):
+            existing_ref = existing.get("r", "A1")
+            existing_col = re.match(r"[A-Z]+", existing_ref)
+            existing_number = 0
+            for char in (existing_col.group(0) if existing_col else "A"):
+                existing_number = existing_number * 26 + ord(char) - 64
+            if existing_number > column_number:
+                row_node.insert(position, cell_node)
+                inserted = True
+                break
+        if not inserted:
+            row_node.append(cell_node)
+
+    for child in list(cell_node):
+        cell_node.remove(child)
+    cell_node.set("t", "str")
+    formula = f'DISPIMG("{image_id}",1)'
+    ET.SubElement(cell_node, f"{{{_OOXML_MAIN_NS}}}f").text = f"_xlfn.{formula}"
+    ET.SubElement(cell_node, f"{{{_OOXML_MAIN_NS}}}v").text = f"={formula}"
+
+
+def _cell_image_extent_emu(image_bytes):
+    """读取截图像素尺寸，并按结果表的最大显示区域换算成 EMU。"""
+    width = 520
+    height = 330
+    data = bytes(image_bytes or b"")
+    if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n"):
+        width, height = struct.unpack(">II", data[16:24])
+    width = max(1, int(width or 1))
+    height = max(1, int(height or 1))
+    scale = min(520 / width, 330 / height, 1.0)
+    return int(width * scale * 9525), int(height * scale * 9525)
+
+
+def _set_cell_picture_extent(picture, image_bytes):
+    """WPS 依赖 pic/spPr/xfrm/ext；为 0 时 DISPIMG 只显示空白。"""
+    transform = picture.find(
+        f".//{{{_OOXML_DRAWING_NS}}}spPr/{{{_OOXML_DRAWING_MAIN_NS}}}xfrm"
+    )
+    if transform is None:
+        shape_properties = picture.find(f"{{{_OOXML_DRAWING_NS}}}spPr")
+        if shape_properties is None:
+            shape_properties = ET.SubElement(picture, f"{{{_OOXML_DRAWING_NS}}}spPr")
+        transform = ET.SubElement(shape_properties, f"{{{_OOXML_DRAWING_MAIN_NS}}}xfrm")
+    offset = transform.find(f"{{{_OOXML_DRAWING_MAIN_NS}}}off")
+    if offset is None:
+        offset = ET.SubElement(transform, f"{{{_OOXML_DRAWING_MAIN_NS}}}off")
+    offset.set("x", offset.get("x") or "0")
+    offset.set("y", offset.get("y") or "0")
+    extent = transform.find(f"{{{_OOXML_DRAWING_MAIN_NS}}}ext")
+    if extent is None:
+        extent = ET.SubElement(transform, f"{{{_OOXML_DRAWING_MAIN_NS}}}ext")
+    width_emu, height_emu = _cell_image_extent_emu(image_bytes)
+    extent.set("cx", str(width_emu))
+    extent.set("cy", str(height_emu))
+
+
+def repair_cell_image_extents(workbook_path):
+    """修复旧版代码生成的 0 尺寸单元格图片。"""
+    path = Path(workbook_path)
+    rewritten = path.with_name(f".{path.name}.{uuid.uuid4().hex}.repair-cell-images.tmp")
+    with zipfile.ZipFile(path, "r") as source:
+        parts = {name: source.read(name) for name in source.namelist() if not name.endswith("/")}
+    cell_images_part = "xl/cellimages.xml"
+    rels_part = "xl/_rels/cellimages.xml.rels"
+    if cell_images_part not in parts or rels_part not in parts:
+        return 0
+    cell_images = ET.fromstring(parts[cell_images_part])
+    relationships = ET.fromstring(parts[rels_part])
+    image_targets = {
+        item.get("Id"): _resolve_ooxml_target(cell_images_part, item.get("Target", ""))
+        for item in relationships.findall(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship")
+        if str(item.get("Type", "")).endswith("/image")
+    }
+    repaired = 0
+    for cell_image in cell_images.findall(f"{{{_WPS_CELL_IMAGE_NS}}}cellImage"):
+        picture = cell_image.find(f"{{{_OOXML_DRAWING_NS}}}pic")
+        if picture is None:
+            continue
+        blip = picture.find(f".//{{{_OOXML_DRAWING_MAIN_NS}}}blip")
+        media_part = image_targets.get(blip.get(f"{{{_OOXML_REL_NS}}}embed")) if blip is not None else None
+        if not media_part or media_part not in parts:
+            continue
+        _set_cell_picture_extent(picture, parts[media_part])
+        repaired += 1
+    if not repaired:
+        return 0
+    parts[cell_images_part] = _xml_bytes(cell_images, _WPS_CELL_IMAGE_NS)
+    with zipfile.ZipFile(rewritten, "w", compression=zipfile.ZIP_DEFLATED) as target:
+        for name, data in parts.items():
+            target.writestr(name, data)
+    os.replace(rewritten, path)
+    return repaired
+
+
+def convert_floating_images_to_cell_images(workbook_path):
+    """把 openpyxl 浮动图片转换成 WPS/Excel 可识别的单元格内图片。
+
+    openpyxl 只能写 drawing 锚点，表格排序、筛选或调整行列后容易错位。
+    WPS 的单元格图片使用 DISPIMG 公式和 xl/cellimages.xml。本函数在
+    openpyxl 保存后重写 OOXML，让每张渠道截图成为对应单元格的实际内容。
+    """
+    path = Path(workbook_path)
+    rewritten = path.with_name(f".{path.name}.{uuid.uuid4().hex}.cell-images.tmp")
+    with zipfile.ZipFile(path, "r") as source:
+        parts = {name: source.read(name) for name in source.namelist() if not name.endswith("/")}
+
+    worksheet_parts = sorted(
+        name
+        for name in parts
+        if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)
+    )
+    converted = []
+    removed_parts = set()
+
+    for worksheet_part in worksheet_parts:
+        rels_part = posixpath.join(
+            posixpath.dirname(worksheet_part),
+            "_rels",
+            f"{posixpath.basename(worksheet_part)}.rels",
+        )
+        if rels_part not in parts:
+            continue
+
+        sheet_root = ET.fromstring(parts[worksheet_part])
+        sheet_rels = ET.fromstring(parts[rels_part])
+        drawing_relationships = [
+            item
+            for item in sheet_rels.findall(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship")
+            if str(item.get("Type", "")).endswith("/drawing")
+        ]
+        sheet_changed = False
+
+        for drawing_relationship in drawing_relationships:
+            drawing_part = _resolve_ooxml_target(
+                worksheet_part,
+                drawing_relationship.get("Target", ""),
+            )
+            drawing_rels_part = posixpath.join(
+                posixpath.dirname(drawing_part),
+                "_rels",
+                f"{posixpath.basename(drawing_part)}.rels",
+            )
+            if drawing_part not in parts or drawing_rels_part not in parts:
+                continue
+
+            drawing_root = ET.fromstring(parts[drawing_part])
+            drawing_rels = ET.fromstring(parts[drawing_rels_part])
+            image_targets = {
+                item.get("Id"): _resolve_ooxml_target(
+                    drawing_part,
+                    item.get("Target", ""),
+                )
+                for item in drawing_rels.findall(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship")
+                if str(item.get("Type", "")).endswith("/image")
+            }
+
+            anchors_to_remove = []
+            for anchor in list(drawing_root):
+                anchor_name = anchor.tag.rsplit("}", 1)[-1]
+                if anchor_name not in {"oneCellAnchor", "twoCellAnchor"}:
+                    continue
+                marker = anchor.find(f"{{{_OOXML_DRAWING_NS}}}from")
+                picture = anchor.find(f"{{{_OOXML_DRAWING_NS}}}pic")
+                if marker is None or picture is None:
+                    continue
+                row_node = marker.find(f"{{{_OOXML_DRAWING_NS}}}row")
+                column_node = marker.find(f"{{{_OOXML_DRAWING_NS}}}col")
+                blip = picture.find(
+                    f".//{{{_OOXML_DRAWING_MAIN_NS}}}blip"
+                )
+                if row_node is None or column_node is None or blip is None:
+                    continue
+                media_part = image_targets.get(blip.get(f"{{{_OOXML_REL_NS}}}embed"))
+                if not media_part or media_part not in parts:
+                    continue
+
+                image_id = f"ID_{uuid.uuid4().hex.upper()}"
+                copied_picture = copy.deepcopy(picture)
+                non_visual = copied_picture.find(
+                    f".//{{{_OOXML_DRAWING_NS}}}cNvPr"
+                )
+                if non_visual is not None:
+                    non_visual.set("id", str(len(converted) + 1))
+                    non_visual.set("name", image_id)
+                _set_cell_picture_extent(copied_picture, parts[media_part])
+                converted.append(
+                    {
+                        "worksheet_part": worksheet_part,
+                        "row": int(row_node.text or 0),
+                        "column": int(column_node.text or 0),
+                        "image_id": image_id,
+                        "picture": copied_picture,
+                        "media_part": media_part,
+                    }
+                )
+                _set_dispimg_formula(
+                    sheet_root,
+                    int(row_node.text or 0),
+                    int(column_node.text or 0),
+                    image_id,
+                )
+                anchors_to_remove.append(anchor)
+                sheet_changed = True
+
+            for anchor in anchors_to_remove:
+                drawing_root.remove(anchor)
+
+            if len(drawing_root) == 0:
+                drawing_id = drawing_relationship.get("Id")
+                sheet_rels.remove(drawing_relationship)
+                for drawing_node in list(sheet_root.findall(f"{{{_OOXML_MAIN_NS}}}drawing")):
+                    if drawing_node.get(f"{{{_OOXML_REL_NS}}}id") == drawing_id:
+                        sheet_root.remove(drawing_node)
+                removed_parts.update({drawing_part, drawing_rels_part})
+            elif anchors_to_remove:
+                parts[drawing_part] = _xml_bytes(drawing_root, _OOXML_DRAWING_NS)
+
+        if sheet_changed:
+            parts[worksheet_part] = _xml_bytes(sheet_root, _OOXML_MAIN_NS)
+            parts[rels_part] = _xml_bytes(sheet_rels, _OOXML_PACKAGE_REL_NS)
+
+    if not converted:
+        return 0
+
+    # 每次都从当前 drawing 重建 cellImages；结果同步会从 SQLite 重新插入
+    # 所有已完成截图，因此不会依赖 openpyxl 对 WPS 扩展部件的保留能力。
+    cell_images_root = ET.Element(f"{{{_WPS_CELL_IMAGE_NS}}}cellImages")
+    cell_images_rels = ET.Element(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationships")
+    for number, item in enumerate(converted, 1):
+        relation_id = f"rId{number}"
+        blip = item["picture"].find(f".//{{{_OOXML_DRAWING_MAIN_NS}}}blip")
+        blip.set(f"{{{_OOXML_REL_NS}}}embed", relation_id)
+        cell_image = ET.SubElement(cell_images_root, f"{{{_WPS_CELL_IMAGE_NS}}}cellImage")
+        cell_image.append(item["picture"])
+        ET.SubElement(
+            cell_images_rels,
+            f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship",
+            {
+                "Id": relation_id,
+                "Type": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
+                "Target": posixpath.relpath(item["media_part"], "xl"),
+            },
+        )
+    parts["xl/cellimages.xml"] = _xml_bytes(cell_images_root, _WPS_CELL_IMAGE_NS)
+    parts["xl/_rels/cellimages.xml.rels"] = _xml_bytes(
+        cell_images_rels,
+        _OOXML_PACKAGE_REL_NS,
+    )
+
+    workbook_rels_part = "xl/_rels/workbook.xml.rels"
+    workbook_rels = ET.fromstring(parts[workbook_rels_part])
+    for item in list(workbook_rels.findall(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship")):
+        if item.get("Type") == _WPS_CELL_IMAGE_REL_TYPE:
+            workbook_rels.remove(item)
+    ET.SubElement(
+        workbook_rels,
+        f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship",
+        {
+            "Id": _next_relationship_id(workbook_rels),
+            "Type": _WPS_CELL_IMAGE_REL_TYPE,
+            "Target": "cellimages.xml",
+        },
+    )
+    parts[workbook_rels_part] = _xml_bytes(workbook_rels, _OOXML_PACKAGE_REL_NS)
+
+    content_types_part = "[Content_Types].xml"
+    content_types = ET.fromstring(parts[content_types_part])
+    for item in list(content_types.findall(f"{{{_OOXML_CONTENT_NS}}}Override")):
+        part_name = item.get("PartName", "")
+        if part_name == "/xl/cellimages.xml" or part_name.lstrip("/") in removed_parts:
+            content_types.remove(item)
+    ET.SubElement(
+        content_types,
+        f"{{{_OOXML_CONTENT_NS}}}Override",
+        {
+            "PartName": "/xl/cellimages.xml",
+            "ContentType": _WPS_CELL_IMAGE_CONTENT_TYPE,
+        },
+    )
+    parts[content_types_part] = _xml_bytes(content_types, _OOXML_CONTENT_NS)
+
+    for removed in removed_parts:
+        parts.pop(removed, None)
+
+    with zipfile.ZipFile(rewritten, "w", compression=zipfile.ZIP_DEFLATED) as target:
+        for name, data in parts.items():
+            target.writestr(name, data)
+    os.replace(rewritten, path)
+    return len(converted)
+
+
+def save_workbook_atomic(workbook, target_path, embed_cell_images=False):
     target = Path(target_path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    expected_image_count = sum(
+        len(getattr(worksheet, "_images", []) or [])
+        for worksheet in workbook.worksheets
+    )
     temp = target.with_name(
         f".{target.stem}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp.xlsx"
     )
@@ -162,6 +691,13 @@ def save_workbook_atomic(workbook, target_path):
         workbook.close()
 
     try:
+        if embed_cell_images:
+            converted_image_count = convert_floating_images_to_cell_images(temp)
+            if expected_image_count and converted_image_count != expected_image_count:
+                raise ValueError(
+                    "单元格图片转换数量不一致："
+                    f"应转换 {expected_image_count} 张，实际转换 {converted_image_count} 张"
+                )
         # 临时文件不通过完整性检查时，绝不覆盖用户可见的结果文件。
         validate_workbook_file(temp)
         flush_file_to_disk(temp)
@@ -439,6 +975,10 @@ def configure_platforms(platforms):
             f"delete from tasks where platform not in ({placeholders})",
             tuple(new_platforms.keys()),
         )
+    try:
+        image_reconciliation = reconcile_tasks_with_result_images()
+    except Exception as exc:
+        image_reconciliation = {"kept": 0, "reset": 0, "images": 0, "error": str(exc)}
     # 保存插件渠道配置不能依赖 Excel 是否可写。渠道列生成和历史图片恢复
     # 在点击“开始”时由 /sync-results 单独执行并返回具体错误。
     return {
@@ -447,6 +987,7 @@ def configure_platforms(platforms):
         "stats": stats(),
         "result_excel": str(RESULT_EXCEL),
         "excel_synced": False,
+        "image_reconciliation": image_reconciliation,
     }
 
 
@@ -589,6 +1130,78 @@ def seed_tasks(clear_outputs=False):
                 created += 1
     wb.close()
     return created
+
+
+def reconcile_tasks_with_result_images():
+    """以结果表实际内嵌图片为准：保留好图，只重跑被人工删除的单元格。"""
+    if not RESULT_EXCEL.exists():
+        return {"kept": 0, "reset": 0, "images": 0}
+
+    inventory = embedded_cell_images(RESULT_EXCEL)
+    try:
+        rerun_unmatched_platforms = set(json.loads(get_run_state(RERUN_UNMATCHED_STATE_KEY, "[]")) or [])
+    except Exception:
+        rerun_unmatched_platforms = set()
+    wb = load_workbook(RESULT_EXCEL, read_only=False, data_only=False, keep_links=False)
+    try:
+        ws = find_question_worksheet(wb)
+        headers = read_headers(ws)
+        updates = []
+        with connect_db() as conn:
+            tasks = conn.execute(
+                "select task_id, row_number, platform, status from tasks"
+            ).fetchall()
+            kept = 0
+            reset = 0
+            for task in tasks:
+                platform = PLATFORMS.get(task["platform"])
+                if not platform:
+                    continue
+                image_col = headers.get(platform["column"])
+                if not image_col:
+                    continue
+                row_number = int(task["row_number"])
+                has_image = (row_number, int(image_col)) in inventory
+                if has_image and task["status"] == "pending":
+                    status_col = headers.get(f"{platform['column']}_状态")
+                    followup_col = headers.get(f"{platform['column']}_追问次数")
+                    status_text = str(ws.cell(row=row_number, column=status_col).value or "") if status_col else ""
+                    if task["platform"] in rerun_unmatched_platforms and status_text == "未命中":
+                        # 用户明确选择重跑该平台未命中项时，即使旧截图仍嵌在
+                        # 结果表中也保持 pending；新结果会覆盖同一单元格。
+                        continue
+                    followup_value = ws.cell(row=row_number, column=followup_col).value if followup_col else 0
+                    try:
+                        followup_count = int(followup_value or 0)
+                    except Exception:
+                        followup_count = 0
+                    updates.append((
+                        "done",
+                        1 if status_text.startswith("命中") else 0,
+                        followup_count,
+                        None,
+                        now(),
+                        task["task_id"],
+                    ))
+                    kept += 1
+                elif not has_image and task["status"] == "done":
+                    updates.append(("pending", None, 0, None, now(), task["task_id"]))
+                    reset += 1
+
+            if updates:
+                conn.executemany(
+                    """
+                    update tasks
+                    set status = ?, matched = ?, followup_count = ?,
+                        screenshot_path = ?, answer_text = '', error = null,
+                        answer_debug = null, run_debug = null, updated_at = ?
+                    where task_id = ?
+                    """,
+                    updates,
+                )
+        return {"kept": kept, "reset": reset, "images": len(inventory)}
+    finally:
+        wb.close()
 
 
 def target_context_key(keywords):
@@ -759,6 +1372,34 @@ def get_next_task(excluded_platforms=None):
         "answer_min_chars": ANSWER_MIN_CHARS,
         "answer_timeout_seconds": ANSWER_TIMEOUT_SECONDS,
     }
+
+
+def peek_next_task(excluded_platforms=None):
+    """查看下一条待执行任务，但不提前把它标记为 running。"""
+    excluded_platforms = [
+        str(platform).strip()
+        for platform in (excluded_platforms or [])
+        if str(platform).strip() in PLATFORMS
+    ]
+    where_sql = "status = 'pending'"
+    params = []
+    if excluded_platforms:
+        placeholders = ", ".join("?" for _ in excluded_platforms)
+        where_sql += f" and platform not in ({placeholders})"
+        params.extend(excluded_platforms)
+    with lock, connect_db() as conn:
+        task = conn.execute(
+            f"""
+            select task_id, platform from tasks
+            where {where_sql}
+            order by row_number asc, platform asc
+            limit 1
+            """,
+            params,
+        ).fetchone()
+    if not task:
+        return None
+    return {"task_id": task["task_id"], "platform": task["platform"]}
 
 
 def image_from_data_url(data_url, platform, task_id, matched):
@@ -983,6 +1624,18 @@ def migrate_images_inside_cells(ws):
     return changed
 
 
+def clear_dispimg_formula_cells(ws):
+    """清除 openpyxl 无法保留资源的旧 DISPIMG 占位，随后从图片字节重建。"""
+    cleared = 0
+    for row in ws.iter_rows():
+        for cell in row:
+            value = cell.value
+            if isinstance(value, str) and "DISPIMG(" in value.upper():
+                cell.value = None
+                cleared += 1
+    return cleared
+
+
 def compact_text(value, limit=None):
     text = str(value or "").replace("\r", " ").replace("\n", " ")
     text = re.sub(r"\s+", " ", text).strip()
@@ -1059,13 +1712,11 @@ def write_temp_answer_sheet(payload):
         return _write_temp_answer_sheet_unlocked(payload)
 
 
-def add_screenshot_to_worksheet(ws, screenshot_path, row_number, image_col):
-    if not screenshot_path or not Path(screenshot_path).exists():
-        return False
+def add_excel_image_to_worksheet(ws, image_source, row_number, image_col, source_label="image"):
     try:
         image_cell = f"{col_letter(ws, image_col)}{row_number}"
         remove_images_at_cell(ws, image_cell)
-        img = ExcelImage(str(screenshot_path))
+        img = ExcelImage(image_source)
         original_width = max(1, int(getattr(img, "width", 1) or 1))
         original_height = max(1, int(getattr(img, "height", 1) or 1))
         max_width = 520
@@ -1087,8 +1738,32 @@ def add_screenshot_to_worksheet(ws, screenshot_path, row_number, image_col):
         ws.add_image(img)
         return True
     except Exception as exc:
-        print(f"截图无法嵌入 Excel：{screenshot_path}；原因：{exc}")
+        print(f"截图无法嵌入 Excel：{source_label}；原因：{exc}")
         return False
+
+
+def add_screenshot_to_worksheet(ws, screenshot_path, row_number, image_col):
+    if not screenshot_path or not Path(screenshot_path).exists():
+        return False
+    return add_excel_image_to_worksheet(
+        ws,
+        str(screenshot_path),
+        row_number,
+        image_col,
+        source_label=str(screenshot_path),
+    )
+
+
+def add_embedded_image_to_worksheet(ws, image_bytes, row_number, image_col):
+    if not image_bytes:
+        return False
+    return add_excel_image_to_worksheet(
+        ws,
+        io.BytesIO(image_bytes),
+        row_number,
+        image_col,
+        source_label=f"内嵌图片 R{row_number}C{image_col}",
+    )
 
 
 def resolve_result_row(ws, headers, result):
@@ -1150,7 +1825,7 @@ def write_result_to_excel(result, screenshot_path):
         if not add_screenshot_to_worksheet(ws, screenshot_path, row_number, image_col):
             raise RuntimeError(f"截图无法嵌入 Excel：{screenshot_path}")
 
-        save_workbook_atomic(wb, RESULT_EXCEL)
+        save_workbook_atomic(wb, RESULT_EXCEL, embed_cell_images=True)
 
 
 def sync_result_from_db():
@@ -1160,7 +1835,14 @@ def sync_result_from_db():
     LAST_SYNC_WARNING = ""
     try:
         with lock:
-            prepare_workbook()
+            # openpyxl 不保留 WPS cellimages 扩展；必须在任何保存动作之前
+            # 先把现有内嵌图片读出，随后与本轮新截图一起重新封装。
+            preserved_images = embedded_cell_images(RESULT_EXCEL) if RESULT_EXCEL.exists() else {}
+            if not INPUT_EXCEL.exists():
+                raise FileNotFoundError(f"找不到输入 Excel：{INPUT_EXCEL}")
+            if not RESULT_EXCEL.exists():
+                RESULT_EXCEL.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(INPUT_EXCEL, RESULT_EXCEL)
             with connect_db() as conn:
                 rows = conn.execute(
                     """
@@ -1175,7 +1857,19 @@ def sync_result_from_db():
             ws = find_question_worksheet(wb)
             wb.active = wb.worksheets.index(ws)
             headers = ensure_output_columns(ws)
+            # 绝不能先把正式表保存成“只有公式、没有媒体”的中间状态。
+            # 旧公式在内存中清掉，再用已提取字节和现存截图一次性原子重建。
+            clear_dispimg_formula_cells(ws)
             image_failures = []
+            preserved_inserted = set()
+            for (preserved_row, preserved_col), image_bytes in preserved_images.items():
+                if add_embedded_image_to_worksheet(
+                    ws,
+                    image_bytes,
+                    preserved_row,
+                    preserved_col,
+                ):
+                    preserved_inserted.add((preserved_row, preserved_col))
             for task in rows:
                 platform = PLATFORMS.get(task["platform"])
                 if not platform:
@@ -1192,20 +1886,24 @@ def sync_result_from_db():
                 row_number = resolve_result_row(ws, headers, dict(task))
                 ws.cell(row=row_number, column=status_col, value=status_text)
                 ws.cell(row=row_number, column=followup_col, value=int(task["followup_count"] or 0))
-                image_inserted = add_screenshot_to_worksheet(
-                    ws,
-                    task["screenshot_path"],
-                    row_number,
-                    image_col,
-                )
+                if task["screenshot_path"] and Path(task["screenshot_path"]).exists():
+                    image_inserted = add_screenshot_to_worksheet(
+                        ws,
+                        task["screenshot_path"],
+                        row_number,
+                        image_col,
+                    )
+                else:
+                    image_inserted = (row_number, image_col) in preserved_inserted
                 if not image_inserted:
                     image_failures.append(task["task_id"])
+                    ws.cell(row=row_number, column=image_col, value=None)
                     ws.cell(
                         row=row_number,
                         column=status_col,
                         value="失败：历史截图缺失或损坏，请重置失败任务",
                     )
-            save_workbook_atomic(wb, RESULT_EXCEL)
+            save_workbook_atomic(wb, RESULT_EXCEL, embed_cell_images=True)
 
             if image_failures:
                 with connect_db() as conn:
@@ -1271,23 +1969,38 @@ def submit_result(payload):
         matched,
     )
 
+    # 三个平台统一执行最终 PNG 红框验收。浏览器网页覆盖层可能在截图瞬间丢失，
+    # 因此优先检查图片本身；缺框时按精确 DOM 坐标在服务端补画。
+    box_verified = bool(screenshot_path and matched and image_has_red_box(screenshot_path))
     dom_box_marked = False
-    if screenshot_path and payload.get("platform") == "qianwen" and matched:
+    if screenshot_path and matched and not box_verified:
         dom_box_marked = mark_screenshot_from_dom_location(screenshot_path, dom_location)
-        payload["dom_box_marked"] = dom_box_marked
+        box_verified = bool(dom_box_marked and image_has_red_box(screenshot_path))
+    payload["dom_box_marked"] = dom_box_marked
 
-    if screenshot_path and payload.get("platform") == "qianwen" and matched and not dom_box_marked:
+    if screenshot_path and matched and not box_verified:
         ocr_keywords = payload.get("keywords") or matched_keywords or content_keywords
+        platform_regions = {
+            "qianwen": (0.18, 0.14, 0.96, 0.82),
+            "yuanbao": (0.18, 0.10, 0.98, 0.86),
+            "doubao": (0.18, 0.10, 0.98, 0.86),
+        }
         ocr_result = process_screenshot_with_ocr(
             screenshot_path,
             ocr_keywords,
-            # 千问截图只在正文区域 OCR，避开左侧栏、顶部问题气泡和底部输入框。
-            region_ratio=(0.18, 0.14, 0.96, 0.82),
+            # 三个平台都只在正文区域 OCR，避开左栏、问题气泡和输入框。
+            region_ratio=platform_regions.get(payload.get("platform"), (0.14, 0.10, 0.98, 0.88)),
         )
         payload["ocr_debug"] = ocr_result
         if ocr_result.get("matched") and ocr_result.get("keyword"):
             matched = True
             matched_keywords = list(dict.fromkeys([*matched_keywords, ocr_result.get("keyword")]))
+            box_verified = image_has_red_box(screenshot_path)
+
+    # 命中但最终 PNG 没有通过红框验收时，必须明确失败，不能把无框图写成命中。
+    if matched and (not screenshot_path or not box_verified):
+        payload["error"] = "回答已命中目标关键词，但最终截图没有通过红框校验，请重跑该任务"
+    payload["box_verified"] = bool(box_verified)
 
     payload["matched"] = matched
     payload["matched_keywords"] = matched_keywords
@@ -1332,13 +2045,10 @@ def submit_result(payload):
 
     result_exported = False
     if screenshot_path:
-        try:
-            write_result_to_excel(payload, screenshot_path)
-            result_exported = True
-        except Exception as exc:
-            print(f"结果表写入暂缓，稍后会从 SQLite 自动补齐：{exc}")
-
-    if not result_exported:
+        # 单元格图片属于 WPS 扩展结构，openpyxl 再次打开时不会可靠保留。
+        # 每次从 SQLite 重建所有已完成截图，确保后续任务不会覆盖先前图片。
+        result_exported = sync_result_from_db()
+    else:
         sync_result_from_db()
 
     return {
@@ -1447,6 +2157,57 @@ def stats():
         return {row["status"]: row["count"] for row in rows}
 
 
+def cleanup_batch_intermediate_files(screenshot_paths):
+    """删除本轮数据库明确登记的中间文件，不触碰结果表或历史未知文件。"""
+    removed = []
+    errors = []
+
+    clear_target_platform_context_cache()
+    try:
+        clear_target_research_cache()
+        removed.append("target_research_cache")
+    except Exception as exc:
+        errors.append(f"目标调研缓存：{exc}")
+
+    if TEMP_ANSWERS_EXCEL.exists():
+        try:
+            TEMP_ANSWERS_EXCEL.unlink()
+            removed.append(str(TEMP_ANSWERS_EXCEL))
+        except Exception as exc:
+            errors.append(f"临时回答表：{exc}")
+
+    screenshot_root = SCREENSHOT_DIR.resolve()
+    for raw_path in screenshot_paths or []:
+        if not raw_path:
+            continue
+        try:
+            path = Path(raw_path).expanduser().resolve()
+            if not path.is_relative_to(screenshot_root):
+                errors.append(f"拒绝删除截图目录外文件：{path}")
+                continue
+            if path.exists() and path.is_file():
+                path.unlink()
+                removed.append(str(path))
+        except Exception as exc:
+            errors.append(f"截图中间文件 {raw_path}：{exc}")
+
+    # 用户明确要求每轮完成后清空 output/screenshots。结果 Excel 已通过
+    # sync_result_from_db 完整校验并内嵌全部图片，因此目录内剩余文件均为
+    # 本轮可再生中间件（包括状态变化后未继续登记在 SQLite 的旧截图）。
+    if SCREENSHOT_DIR.exists():
+        for path in SCREENSHOT_DIR.rglob("*"):
+            try:
+                resolved = path.resolve()
+                if resolved.is_relative_to(screenshot_root) and path.is_file():
+                    path.unlink()
+                    if str(path) not in removed:
+                        removed.append(str(path))
+            except Exception as exc:
+                errors.append(f"截图目录清理 {path}：{exc}")
+
+    return {"removed_count": len(removed), "removed": removed, "errors": errors}
+
+
 def finalize_batch():
     """Export the completed batch, then clear SQLite's temporary task records."""
     with lock:
@@ -1456,6 +2217,13 @@ def finalize_batch():
                 "ok": False,
                 "cleared": False,
                 "error": "仍有待执行或运行中的任务，不能清空临时进度",
+                "stats": summary,
+            }
+        if int(summary.get("failed", 0) or 0):
+            return {
+                "ok": False,
+                "cleared": False,
+                "error": "仍有失败任务，必须重置并补跑成功后才能清理截图和进度",
                 "stats": summary,
             }
         if not int(summary.get("done", 0) or 0) and not int(summary.get("failed", 0) or 0):
@@ -1472,7 +2240,14 @@ def finalize_batch():
             }
 
         with connect_db() as conn:
+            screenshot_paths = [
+                row[0]
+                for row in conn.execute(
+                    "select screenshot_path from tasks where screenshot_path is not null"
+                ).fetchall()
+            ]
             conn.execute("delete from tasks")
+        set_run_state(RERUN_UNMATCHED_STATE_KEY, "[]")
 
         # Keep a tiny empty schema file so health checks remain available, while
         # removing all batch data and truncating SQLite's transient WAL content.
@@ -1480,14 +2255,17 @@ def finalize_batch():
             conn.execute("pragma wal_checkpoint(TRUNCATE)")
             conn.execute("vacuum")
 
-        clear_target_platform_context_cache()
+        # 结果表已经包含单元格内嵌图片，不再依赖外部 PNG。此时再清理，
+        # 既不会造成图片丢失，也能保证下一轮不沿用本轮回答或搜索背景。
+        cleanup_result = cleanup_batch_intermediate_files(screenshot_paths)
 
         return {
-            "ok": True,
+            "ok": not cleanup_result["errors"],
             "cleared": True,
             "stats_before_clear": summary,
             "stats": {},
             "result_excel": str(RESULT_EXCEL),
+            "intermediate_cleanup": cleanup_result,
         }
 
 
@@ -1508,6 +2286,60 @@ def reset_failed_tasks():
         )
         reset_count = cursor.rowcount
     return {"ok": True, "reset_count": reset_count, "stats": stats()}
+
+
+def reset_unmatched_tasks(platform="qianwen"):
+    """只重跑结果表中指定平台的“未命中”行，保留所有已命中和其他平台。"""
+    platform = str(platform or "qianwen").strip().lower()
+    if platform not in PLATFORMS:
+        return {"ok": False, "error": f"未知平台：{platform}"}
+    if not RESULT_EXCEL.exists():
+        return {"ok": False, "error": f"结果表不存在：{RESULT_EXCEL}"}
+
+    seed_tasks()
+    # 先按当前内嵌图片恢复所有已完成任务，再单独放开指定平台未命中项。
+    reconcile_tasks_with_result_images()
+    wb = load_workbook(RESULT_EXCEL, read_only=False, data_only=False, keep_links=False)
+    try:
+        ws = find_question_worksheet(wb)
+        headers = read_headers(ws)
+        platform_config = PLATFORMS[platform]
+        status_col = headers.get(f"{platform_config['column']}_状态")
+        if not status_col:
+            return {"ok": False, "error": f"结果表缺少状态列：{platform_config['column']}_状态"}
+        unmatched_rows = [
+            row_number
+            for row_number in range(2, ws.max_row + 1)
+            if str(ws.cell(row=row_number, column=status_col).value or "").strip() == "未命中"
+        ]
+    finally:
+        wb.close()
+
+    with connect_db() as conn:
+        if unmatched_rows:
+            placeholders = ",".join("?" for _ in unmatched_rows)
+            cursor = conn.execute(
+                f"""
+                update tasks
+                set status = 'pending', matched = null, followup_count = 0,
+                    screenshot_path = null, answer_text = '', error = null,
+                    answer_debug = null, run_debug = null, updated_at = ?
+                where platform = ? and row_number in ({placeholders})
+                """,
+                (now(), platform, *unmatched_rows),
+            )
+            reset_count = cursor.rowcount
+        else:
+            reset_count = 0
+    set_run_state(RERUN_UNMATCHED_STATE_KEY, json.dumps([platform], ensure_ascii=False))
+    return {
+        "ok": True,
+        "platform": platform,
+        "reset_count": reset_count,
+        "rows": unmatched_rows,
+        "message": f"已仅重置{platform_config['name']}未命中任务 {reset_count} 条；已命中项不会重复运行",
+        "stats": stats(),
+    }
 
 
 def reset_all_tasks():
@@ -1575,6 +2407,13 @@ class Handler(BaseHTTPRequestHandler):
             for value in query.get("exclude_platforms", []):
                 excluded_platforms.extend(value.split(","))
             task = get_next_task(excluded_platforms)
+            self._send(200, {"ok": True, "task": task})
+        elif path == "/peek-task":
+            query = parse_qs(urlparse(self.path).query)
+            excluded_platforms = []
+            for value in query.get("exclude_platforms", []):
+                excluded_platforms.extend(value.split(","))
+            task = peek_next_task(excluded_platforms)
             self._send(200, {"ok": True, "task": task})
         elif path == "/test-keywords":
             self._send(200, get_test_keywords())
@@ -1735,6 +2574,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, mark_failed(payload))
             elif path == "/reset-failed-tasks":
                 self._send(200, reset_failed_tasks())
+            elif path == "/reset-unmatched-tasks":
+                result = reset_unmatched_tasks(payload.get("platform") or "qianwen")
+                self._send(200 if result.get("ok") else 400, result)
             elif path == "/reset-running-tasks":
                 self._send(200, reset_failed_tasks())
             elif path == "/reset-all-tasks":

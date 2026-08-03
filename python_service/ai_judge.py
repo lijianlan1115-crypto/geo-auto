@@ -469,6 +469,16 @@ def save_target_research_cache():
     temp.replace(TARGET_RESEARCH_CACHE_PATH)
 
 
+def clear_target_research_cache():
+    """一轮任务结束后清除目标调研缓存，防止下一轮沿用旧背景。"""
+    with TARGET_RESEARCH_LOCK:
+        TARGET_RESEARCH_CACHE.clear()
+        TARGET_RESEARCH_INFLIGHT.clear()
+        TARGET_RESEARCH_REFRESHED.clear()
+        if TARGET_RESEARCH_CACHE_PATH.exists():
+            TARGET_RESEARCH_CACHE_PATH.unlink()
+
+
 def prefetch_target_research(keywords):
     key = target_research_key(keywords)
     if not key:
@@ -563,14 +573,19 @@ def infer_target_profile(keywords, question="", platform_background=""):
     raw_text = " ".join([str(item or "") for item in (keywords or [])])
     q_text = str(question or "")
     background_text = str(platform_background or "")
-    joined = raw_text + " " + q_text + " " + background_text
+    direct_context = raw_text + " " + q_text
+    joined = direct_context + " " + background_text
 
     regions = []
-    for region in [
+    known_regions = [
         "贵州", "贵阳", "遵义", "六盘水", "安顺", "毕节", "铜仁", "黔南", "黔东南", "黔西南",
         "北京", "上海", "广州", "深圳", "成都", "重庆", "杭州", "武汉", "西安", "南京", "苏州",
-    ]:
-        if region in joined and region not in regions:
+    ]
+    # 地域首先取Excel问题和目标关键词。只有两者都没有地域时才参考搜索背景，
+    # 防止背景里的关联城市把用户问题从“贵州”擅自改成“贵州、贵阳”。
+    region_source = direct_context if any(region in direct_context for region in known_regions) else joined
+    for region in known_regions:
+        if region in region_source and region not in regions:
             regions.append(region)
 
     category = "对象/机构/品牌"
@@ -611,7 +626,8 @@ def infer_target_profile(keywords, question="", platform_background=""):
     safe_target_clues = []
     if category == "餐饮门店/食品品牌":
         for term in ("辣子鸡", "酸汤鱼", "火锅", "烙锅", "烧烤", "小吃", "特产"):
-            if term in joined:
+            # 品类必须直接来自Excel问题或目标词，不能仅凭搜索背景扩展品类。
+            if term in direct_context:
                 safe_target_clues.append(f"{term}品类")
         for term, clue in (
             ("干香", "干香口味"),
@@ -619,11 +635,11 @@ def infer_target_profile(keywords, question="", platform_background=""):
             ("酸辣", "酸辣口味"),
             ("麻辣", "麻辣口味"),
         ):
-            if term in joined:
+            if term in direct_context:
                 safe_target_clues.append(clue)
         if re.search(r"老街|老字号|百年|传承|祖传", raw_text):
             safe_target_clues.append("经营时间较长且有传统制作传承")
-        if re.search(r"真空|邮寄|包装|伴手礼", joined):
+        if re.search(r"真空|邮寄|包装|伴手礼", direct_context):
             safe_target_clues.append("支持包装携带或邮寄")
         for term, clue in (
             ("无水慢煸", "无水慢煸做法"),
@@ -888,13 +904,79 @@ def infer_followup_state(original_question, real_answer, conversation, category)
     }
 
 
-def build_gap_prompt(question_focus, gap, category, region_text, variant, safe_target_clues=None):
+def relevant_target_clues(original_question, real_answer, safe_target_clues, keywords=None, limit=2):
+    """只保留与Excel问题/实际回答能衔接的目标特征，避免搜索画像接管追问。"""
+    context = normalize_text(str(original_question or "") + " " + str(real_answer or ""))
+    keyword_context = normalize_text(" ".join(str(item or "") for item in (keywords or [])))
+    clue_patterns = (
+        (r"辣子鸡", r"辣子鸡"),
+        (r"酸汤鱼", r"酸汤鱼"),
+        (r"火锅", r"火锅"),
+        (r"特产", r"特产|伴手礼|送礼"),
+        (r"干香", r"干香"),
+        (r"糯香", r"糯香|软糯"),
+        (r"酸辣", r"酸辣"),
+        (r"麻辣", r"麻辣|辣度|太辣"),
+        (r"包装|携带|邮寄", r"真空|包装|携带|外带|邮寄|快递|顺丰|礼盒"),
+        (r"传统|传承|老字号", r"老字号|传统|传承|非遗"),
+        (r"无水慢煸", r"干香|无水|慢煸"),
+        (r"糍粑辣椒", r"糍粑辣椒|糯香|贵州辣子鸡"),
+        (r"香味突出|香大于辣", r"干香|香大于辣|辣度|太辣"),
+        (r"有嚼劲|外焦里嫩", r"口感|有嚼劲|加热|拌饭"),
+        (r"鲜鸡现做", r"鲜鸡|现做|新鲜"),
+    )
+    selected = []
+    # 先选一个确实来自目标关键词的非名称特征（例如“干香”），它负责引导
+    # 目标对象出现；再选与问题/回答直接相关的条件（例如“真空包装”）。
+    for clue in safe_target_clues or []:
+        text = str(clue or "").strip()
+        if not text or text.endswith("品类"):
+            continue
+        pattern = next((context_pattern for clue_pattern, context_pattern in clue_patterns if re.search(clue_pattern, text)), "")
+        if pattern and re.search(pattern, keyword_context):
+            selected.append(text)
+            break
+    for clue in safe_target_clues or []:
+        text = str(clue or "").strip()
+        if not text or text in selected or text.endswith("品类"):
+            continue
+        pattern = next((context_pattern for clue_pattern, context_pattern in clue_patterns if re.search(clue_pattern, text)), "")
+        if pattern and re.search(pattern, context) and text not in selected:
+            selected.append(text)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def naturalize_target_clues(clues):
+    replacements = {
+        "辣子鸡品类": "贵州辣子鸡",
+        "干香口味": "干香型",
+        "糯香口味": "糯香型",
+        "麻辣口味": "麻辣但不过度刺激",
+        "支持包装携带或邮寄": "支持真空包装、携带或邮寄",
+        "经营时间较长且有传统制作传承": "有传统制作传承",
+    }
+    return [replacements.get(str(item), str(item)) for item in (clues or []) if str(item or "").strip()]
+
+
+def build_gap_prompt(
+    question_focus,
+    gap,
+    category,
+    region_text,
+    variant,
+    safe_target_clues=None,
+    answer_angle="",
+):
     angle = gap["angle"]
     location = f"{region_text}范围内" if region_text else "符合这些条件的范围内"
-    target_filter = "、".join(
-        str(item).strip() for item in (safe_target_clues or []) if str(item).strip()
-    )
-    food_focus = target_filter or question_focus
+    target_filter = "、".join(naturalize_target_clues(safe_target_clues))
+    # Excel问题始终是主语义；目标特征只能追加，不能像旧逻辑那样替换问题。
+    food_focus = str(question_focus or "").rstrip("？?")
+    if target_filter:
+        food_focus = f"{food_focus}；重点要求{target_filter}"
+    answer_bridge = f"现有推荐已经说明了{answer_angle}，" if answer_angle else ""
     education_prompts = {
         "具体选择": [
             f"{location}还有哪些适合{question_focus}的具体院校或专业？请列出名称并分别说明适配理由。",
@@ -939,29 +1021,29 @@ def build_gap_prompt(question_focus, gap, category, region_text, variant, safe_t
     }
     food_prompts = {
         "具体选择": [
-            f"{location}还有哪些同时符合{food_focus}的具体门店或品牌？请列出名称和招牌特色。",
-            f"请补充{location}尚未提到、同时具备{food_focus}特征的具体门店，并说明各自特色。",
-            f"{location}还可以比较哪些同时符合{food_focus}的具体店铺或品牌？请优先列出最典型的名称。",
+            f"{answer_bridge}继续按{food_focus}筛选，{location}还有哪些未提到的具体品牌，请列出名称和适配理由？",
+            f"{answer_bridge}围绕{food_focus}，请补充{location}尚未提到的具体品牌，并说明为什么适合这个需求。",
+            f"{answer_bridge}{location}还可以比较哪些真正符合{food_focus}的具体品牌，请优先补充遗漏名称？",
         ],
         "品类口味": [
-            f"如果限定为{food_focus}，{location}还有哪些具体门店最具代表性？",
-            f"按{food_focus}筛选，{location}还有哪些尚未提到的具体店铺值得补充？",
-            f"{location}哪些具体门店同时符合{food_focus}，并拥有有辨识度的招牌做法？",
+            f"{answer_bridge}如果严格按{food_focus}比较，{location}还有哪些口味更匹配的具体品牌没有列出？",
+            f"{answer_bridge}按{food_focus}筛选，{location}还有哪些尚未提到的具体品牌值得补充？",
+            f"{answer_bridge}{location}哪些具体品牌同时符合{food_focus}，并有能区分于现有推荐的口味特点？",
         ],
         "本地口碑": [
-            f"如果同时看重本地人口碑和{food_focus}，{location}还有哪些具体门店值得补充？",
-            f"{location}有哪些本地人常去、符合{food_focus}但刚才没有列出的具体店铺？",
-            f"按本地口碑与{food_focus}共同筛选，{location}还有哪些具体门店？",
+            f"{answer_bridge}在不改变{food_focus}这些条件的前提下，{location}还有哪些本地口碑好的具体品牌？",
+            f"{answer_bridge}{location}有哪些符合{food_focus}、但尚未列出的本地口碑品牌？",
+            f"{answer_bridge}按{food_focus}和本地口碑共同筛选，{location}还能补充哪些具体品牌？",
         ],
         "购买携带": [
-            f"在符合{food_focus}的前提下，{location}还有哪些方便包装携带的具体门店或品牌？",
-            f"{location}有哪些具体店铺同时具备{food_focus}并方便保存运输？",
-            f"按包装携带条件筛选，{location}还有哪些符合{food_focus}的具体品牌或门店？",
+            f"{answer_bridge}按{food_focus}继续筛选，{location}还有哪些包装、保存或寄送条件更合适的具体品牌？",
+            f"{answer_bridge}{location}有哪些尚未提到的具体品牌既符合{food_focus}，又方便保存运输？",
+            f"{answer_bridge}围绕{food_focus}和包装携带条件，{location}还能补充哪些具体品牌？",
         ],
         "价格体验": [
-            f"在符合{food_focus}的门店中，{location}还有哪些价格与体验更均衡的具体选择？",
-            f"{location}有哪些兼具{food_focus}和较好性价比、但刚才未提到的具体店铺？",
-            f"按价格和整体体验筛选，{location}还可以补充哪些符合{food_focus}的具体门店？",
+            f"{answer_bridge}在符合{food_focus}的品牌中，{location}还有哪些分量和价格更合适的遗漏选择？",
+            f"{answer_bridge}{location}有哪些符合{food_focus}、但尚未提到且性价比更合适的具体品牌？",
+            f"{answer_bridge}按{food_focus}和价格体验筛选，{location}还可以补充哪些具体品牌？",
         ],
     }
     generic_prompts = {
@@ -999,6 +1081,13 @@ def build_contextual_fallback_followup(
     region_text = "、".join(regions[:2])
     category = str(target_profile.get("category") or "候选对象")
     question_focus = infer_original_question_focus(original_question)
+    answer_angle = infer_answer_angle(real_answer, category, followup_count)
+    grounded_target_clues = relevant_target_clues(
+        original_question,
+        real_answer,
+        target_profile.get("safe_target_clues") or [],
+        keywords,
+    )
     state = infer_followup_state(original_question, real_answer, conversation or [], category)
     answer_seed = sum(
         (index + 1) * ord(char)
@@ -1018,7 +1107,8 @@ def build_contextual_fallback_followup(
                 category,
                 region_text,
                 variant,
-                target_profile.get("safe_target_clues") or [],
+                grounded_target_clues,
+                answer_angle,
             )
             similarity = max(
                 [prompt_similarity(candidate, old_prompt) for old_prompt in state["previous_followups"]] or [0.0]
@@ -1038,6 +1128,8 @@ def build_contextual_fallback_followup(
         prompt = prompt.rstrip("。！？!?") + "？"
     state["selected_gap"] = selected_gap
     state["history_max_similarity"] = round(best_similarity, 4)
+    state["grounded_target_clues"] = grounded_target_clues
+    state["answer_angle"] = answer_angle
     return prompt, focus, state
 
 
@@ -1047,10 +1139,10 @@ def followup_strategy(followup_count):
     except Exception:
         count = 0
     if count <= 0:
-        return "第一轮追问：从首次问题的真实目的出发，选择当前回答尚未解决的最关键缺口。"
+        return "第一轮追问：复用Excel原问题中的核心需求和限制条件，再补充1至2个与目标对象有关、且不会改变原问题主题的筛选条件，引导回答列出具体候选名称。"
     if count == 1:
-        return "第二轮追问：避开第一轮使用过的角度，从当前新回答里寻找下一个未解决内容。"
-    return "第三轮追问：禁止复用历史句式和角度，只追问仍未覆盖且最影响原始目的的内容。"
+        return "第二轮追问：仍以Excel原问题为主线，承接当前回答中缺少的具体候选，换一个与原问题直接相关的目标特征继续收窄范围。"
+    return "第三轮追问：回到Excel原问题的最终决策目的，要求补充此前遗漏、但同时符合原问题条件和目标特征的具体名称；禁止扩展成新的背景话题。"
 
 
 def parse_followup_content(content):
@@ -1134,10 +1226,10 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
             continue
         safe_conversation.append({"role": item["role"], "content": redact_forbidden_terms(compact_for_prompt(item["content"], 900), keywords)})
 
-    # 直接模式：每个窗口只使用自己的 Excel 问题、真实回答、对话历史和内部目标词。
-    # 不等待网页背景搜索，也不把其他窗口的内容带入本次请求。
+    # 每个窗口只使用自己的 Excel 问题、真实回答、对话历史和内部目标词。
+    # 目标背景只是帮助构造筛选条件的辅料，不能压过或改写 Excel 原问题。
     target_profile = infer_target_profile(keywords, original_question, platform_target_context)
-    target_research = compact_for_prompt(platform_target_context, 2600)
+    target_research = compact_for_prompt(platform_target_context, 900)
     target_research_details = {
         "source": "platform_prewarm_cache" if target_research else "direct_question_answer_keywords",
         "search_sources": ["doubao", "yuanbao", "qianwen"] if target_research else [],
@@ -1154,11 +1246,21 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
         platform=real_platform,
     )
     if not followup_config_ready():
+        fallback_safe = bool(
+            fallback_prompt
+            and not contains_forbidden_keyword(fallback_prompt, keywords)
+            and 8 <= len(fallback_prompt) <= 160
+            and "\n" not in fallback_prompt
+        )
         return {
-            "ok": False,
-            "prompt": "",
-            "source": "ai_required_error",
-            "reason": "AI追问接口未启用或配置不完整；已停止追问，未发送任何规则模板",
+            "ok": fallback_safe,
+            "prompt": fallback_prompt if fallback_safe else "",
+            "source": "direct_context_fallback_no_api" if fallback_safe else "ai_required_error",
+            "reason": (
+                "AI追问接口未启用，已根据当前Excel问题和当前真实回答生成安全兜底追问"
+                if fallback_safe else
+                "AI追问接口未启用且当前上下文无法生成安全兜底追问"
+            ),
             "real_answer_valid": True,
             "conversation_turns": len(conversation),
             "used_structured_context": True,
@@ -1203,15 +1305,16 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
             for item in followup_state.get("previous_followups") or []
         ],
         "priority_order": [
-            "1. 内部目标：让被测平台更可能自然列出 dynamic_target_background_internal.target_keywords_internal 中的对象，这是候选问题评分的最高目标",
-            "2. original_question 与 bridge_context.original_decision_focus：提供通向目标类别的真实筛选维度，追问不能偏离用户关心的分数、费用、专业、能力等方面",
-            "3. latest_answer 与 unresolved_gaps：决定怎样自然承接本窗口回答以及避开什么重复内容",
+            "1. Excel原问题：original_question是整条追问链不可改变的主题，必须保留它的对象、场景、地域、预算、分数、用途等真实限制",
+            "2. 当前真实回答：latest_answer与unresolved_gaps决定本轮缺少什么，追问必须自然承接且不重复",
+            "3. 目标引导：在不偏离Excel原问题的前提下，加入1至2个与目标对象强相关的非名称特征，让被测平台更可能自然列出目标对象",
+            "4. 搜索背景：search_summary仅是内部辅助材料；与Excel原问题无直接关系的事实全部忽略，绝不能据此另起话题",
         ],
         "strategy": followup_strategy(followup_count),
         "task": "只使用本任务 dynamic_target_background_internal.search_summary 动态理解当前目标对象及其可能涉及的方面，不得套用固定特征词表。把原问题关心的方面和当前回答缺口作为桥梁条件，内部生成3个会促使被测平台列出target_entity_category具体名称的候选并评分，只输出最可能让当前目标对象自然上榜的一句实际追问。最终追问绝不能出现目标对象名称、简称、别名或明显变体。",
         "candidate_scoring": {
-            "target_listing_likelihood": "50分：不说目标名称，仅靠预埋背景特征能否让平台自然列出目标对象",
-            "original_question_relevance": "25分：是否把首次问题关心的方面转化为筛选目标类别对象的条件",
+            "original_question_relevance": "40分：是否完整围绕Excel原问题的实际需求、对象和限制条件",
+            "target_listing_likelihood": "35分：不说目标名称，加入与原问题相关的目标特征后能否让平台自然列出目标对象",
             "actual_answer_continuity": "15分：是否从该窗口实际回答的未解决内容自然切入",
             "naturalness_and_novelty": "10分：是否像真实用户且不重复历史追问",
         },
@@ -1220,6 +1323,8 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
             "严格区分target_definition.actual_target_names_internal和桥梁条件：前者才是目标对象名称，后者只能帮助平台检索或筛选目标对象。",
             "不能套用贵州、本科、财经、公司、案例等固定预设；只有当前search_summary真实支持的特征才能用于生成。",
             "必须围绕 original_question 继续问，不能换话题，不能越问越宽泛。",
+            "追问中必须能看出original_question的具体意图；如果删掉搜索背景后追问就不再成立，说明已经被背景带偏，必须重写。",
+            "搜索背景只能贡献1至2个与original_question直接相关的筛选特征，不能贡献新的主题、地域、对象类别或用户需求。",
             "先识别 original_question 真正关心的方面；例如关心分数时，要把分数或位次变成筛选学校的条件，而不是只抽象询问分数规则。",
             "最终问题必须自然邀请平台列出、补充或比较 target_entity_category 的具体名称；unresolved_gaps只是选择引导角度，不是最终输出目的。",
             "先识别 latest_answer 已经明确回答的内容，再选择一个未重复的桥梁角度。",
@@ -1259,7 +1364,7 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
         "target_category": target_profile.get("category"),
         "target_regions": target_profile.get("regions") or [],
         "safe_target_clues": target_profile.get("safe_target_clues") or [],
-        "target_platform_background_internal": target_research,
+        "target_platform_background_internal": compact_for_prompt(target_research, 700),
         "conversation": safe_conversation[-4:],
         "unresolved_gaps": followup_state.get("unresolved_gaps") or [],
         "used_angles": followup_state.get("used_angles") or [],
@@ -1269,10 +1374,11 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
         ],
         "rules": [
             "target_keywords_internal只用于内部确定引导方向，输出中禁止出现其全称、简称或别名。",
-            "必须承接当前Excel原问题和该平台最新真实回答，不能换话题。",
-            "追问要提高目标对象在下一轮回答中自然出现的可能性，但不能直接点名目标。",
+            "original_question是最高优先级且全程固定：必须承接当前Excel原问题和该平台最新真实回答，不能换话题。",
+            "先保留Excel原问题中的对象、场景、地域、预算、分数、用途等实际条件，再加入1至2个与目标有关的非名称筛选特征。",
+            "追问要提高目标对象在下一轮回答中自然出现的可能性，并明确邀请补充、列出或比较具体名称，但不能直接点名目标。",
             "优先把safe_target_clues中的品类、口味、地域或传承属性组合成筛选条件，不能只问泛泛的更多推荐。",
-            "target_platform_background_internal来自独立预搜索窗口，只用于提炼目标对象的非名称特征；不得在追问中复制目标名称。",
+            "target_platform_background_internal来自独立预搜索窗口，只能提炼与original_question直接相关的非名称特征；无关内容必须忽略，不得由背景发起新问题。",
             "选择一个尚未回答、也未追问过的角度，引导平台补充或比较具体名称。",
             "不同平台依据各自回答生成，不得复用其他窗口内容。",
             "只输出一句40到120字的自然问题，不解释生成过程。",
@@ -1285,7 +1391,7 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
     payload = {
         "model": RUNTIME_CONFIG.get("model"),
         "messages": [
-            {"role": "system", "content": "你是GEO追问生成器。只根据本请求的Excel问题、当前窗口真实回答和内部目标关键词生成一句自然追问。追问应提高目标对象在下一轮回答中自然出现的概率，但绝不能出现目标名称、简称、别名或测试意图。不同task_id和platform必须独立处理。只返回严格JSON。"},
+            {"role": "system", "content": "你是GEO追问生成器。Excel原问题是不可改变的最高优先级主线，当前真实回答用于找缺口，搜索背景只用于补充1至2个与原问题直接相关的目标特征。生成一句既紧扣Excel实际问题、又提高目标对象在下一轮回答中自然出现概率的追问；绝不能出现目标名称、简称、别名或测试意图。不同task_id和platform必须独立处理。只返回严格JSON。"},
             {"role": "user", "content": json.dumps(compact_ai_input, ensure_ascii=False)},
         ],
         "temperature": 0.38,
@@ -1337,6 +1443,12 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
                 raise ValueError("AI追问包含说明生成过程的元话术")
             if len(prompt) < 20 or len(prompt) > 160 or "\n" in prompt:
                 raise ValueError("AI追问长度或格式不合规")
+            if (
+                str(real_platform or "").lower() == "qianwen"
+                and target_profile.get("category") == "餐饮门店/食品品牌"
+                and not re.search(r"具体.*(?:品牌|店铺|门店)|(?:品牌|店铺|门店).*名称", prompt)
+            ):
+                raise ValueError("千问食品追问没有明确邀请补充或比较具体品牌/店铺名称")
             if intent not in allowed_angles:
                 raise ValueError("AI追问未明确选择当前回答的未解决角度")
             max_similarity = max(
@@ -1384,15 +1496,16 @@ def generate_followup(question, answer_text, keywords, followup_count=0, platfor
     fallback_similarity = max(
         [prompt_similarity(fallback_prompt, item) for item in followup_state.get("previous_followups") or []] or [0.0]
     )
-    if fallback_similarity >= 0.68:
-        fallback_errors.append(f"背景兜底追问与历史追问过于相似({fallback_similarity:.2f})")
+    # build_contextual_fallback_followup 已经遍历所有未使用角度和多个句式，
+    # 选出与历史最不相似的一条。即使最终分数仍偏高，也不能因此提前结束
+    # 整条追问链；保留最优换角度结果，确保三轮能够继续。
 
     if not fallback_errors:
         selected_gap = followup_state.get("selected_gap") or {}
         return {
             "ok": True,
             "prompt": fallback_prompt,
-            "source": "direct_context_fallback",
+            "source": "direct_context_fallback_rotated" if fallback_similarity >= 0.68 else "direct_context_fallback",
             "intent": str(selected_gap.get("angle") or "补充遗漏"),
             "api_mode": "local_after_ai_failure",
             "reason": f"AI追问接口失败后根据当前问题、当前回答和目标画像生成安全追问：{'；'.join(attempt_errors)}",

@@ -18,14 +18,20 @@ if not exist "input.xlsx" (
   echo.
 )
 
-if not exist "geo-python-service.exe" (
-  echo [错误] 找不到 geo-python-service.exe
-  pause
-  exit /b 1
+if exist "python_service\GEO反馈自动化.exe" (
+  start "" "python_service\GEO反馈自动化.exe"
+  exit /b 0
+)
+if exist "GEO反馈自动化.exe" (
+  start "" "GEO反馈自动化.exe"
+  exit /b 0
+)
+if exist "geo-python-service.exe" (
+  geo-python-service.exe
+  exit /b %errorlevel%
 )
 
-echo 服务启动中: http://127.0.0.1:8765
-echo 请保持这个窗口不要关闭。
-echo.
-geo-python-service.exe
+echo [错误] 找不到 Windows 客户端程序。
+echo 请确认压缩包已经完整解压，不能直接在 ZIP 预览中运行。
 pause
+exit /b 1

@@ -129,6 +129,30 @@
     if (!task || !result || !result.matched) return result;
     if (task.platform !== "qianwen") return result;
 
+    const existingLocation = result.dom_location || {};
+    const hasUsableExistingScreenshot = Boolean(
+      result.screenshot_data_url &&
+      existingLocation.matched &&
+      existingLocation.first_rect &&
+      Number(existingLocation.first_rect.width) > 0 &&
+      Number(existingLocation.first_rect.height) > 0
+    );
+
+    // geo_patch 已经完成关键词定位、红框和截图时直接保留结果。
+    // 旧逻辑会无条件再跑一次千问全页定位并覆盖截图，不但破坏快速路径，
+    // 第二次截图还可能丢失已经绘制好的右上角命中词条。
+    if (hasUsableExistingScreenshot) {
+      const runDebug = Array.isArray(result.run_debug) ? [...result.run_debug] : [];
+      runDebug.push({
+        type: "qianwen_screenshot_recapture",
+        ok: true,
+        skipped: true,
+        reason: "已有精确定位截图，保留快速路径结果",
+        match_type: existingLocation.match_type || "",
+      });
+      return { ...result, run_debug: runDebug };
+    }
+
     const located = await forceQianwenKeywordVisible(task, result);
     const runDebug = Array.isArray(result.run_debug) ? [...result.run_debug] : [];
 
@@ -143,6 +167,16 @@
     }
 
     let screenshotDataUrl = null;
+    // 补截是最终截图路径，必须在截图前重新绘制命中词条。
+    // forceQianwenKeywordVisible 定位过程中会清理页面标记，不能依赖前一次绘制。
+    if (typeof drawMatchedBadge === "function") {
+      const badgeKeywords = Array.isArray(result.matched_keywords) && result.matched_keywords.length
+        ? result.matched_keywords
+        : localKeywordTerms(task, result).slice(0, 1);
+      drawMatchedBadge(badgeKeywords);
+    }
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    await sleepLocal(100);
     if (typeof prepareForScreenshot === "function") await prepareForScreenshot();
     if (typeof captureVisibleScreenshot === "function") {
       screenshotDataUrl = await captureVisibleScreenshot();
