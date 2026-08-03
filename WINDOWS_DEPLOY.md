@@ -58,7 +58,26 @@ start_windows.bat
 
 启动成功后，命令窗口不要关闭。
 
-## 方式二：打包成 exe，给没有 Python 的电脑用
+## 客户版（推荐，无需安装 Python 和 Tesseract）
+
+从 GitHub Releases 下载 `GEO反馈自动化_Windows.zip`，完整解压后双击：
+
+```text
+启动GEO自动化.bat
+```
+
+首次运行选择客户自己的 `.xlsx` 问题表。客户包已经包含：
+
+```text
+Windows 图形客户端
+Chrome 扩展完整源码
+中文/英文 Tesseract OCR 运行环境
+input_template.xlsx 表格模板
+```
+
+不要直接在 ZIP 压缩包预览窗口中双击运行，否则 EXE、OCR 和扩展目录之间的相对路径会失效。
+
+## 自己构建 exe
 
 先在一台有 Python 的 Windows 电脑上运行：
 
@@ -161,7 +180,7 @@ https://tongyi.aliyun.com/qianwen/
 
 ### 4. OCR 报错
 
-OCR 是备用能力。Windows 没安装 Tesseract 时，OCR 兜底可能不可用，但主要 DOM 定位、滚动截图、图片二次拉框仍然可以运行。
+正式客户 ZIP 已自带 `python_service\Tesseract-OCR` 和简体中文语言包，不需要单独安装。请确认整个 ZIP 已完整解压，且安全软件没有隔离 `tesseract.exe`。
 
 ### 5. 结果保存在哪里
 
@@ -170,4 +189,4 @@ output\result.xlsx
 output\ai返回内容临时表.xlsx
 ```
 
-`result.xlsx` 是最终表，`ai返回内容临时表.xlsx` 是中间过程表。
+最终文件默认采用 `GEO反馈结果_时间_正式.xlsx` 命名；截图会以真正的单元格图片写入工作簿，不依赖清理后的外部 PNG。

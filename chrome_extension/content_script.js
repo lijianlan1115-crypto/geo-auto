@@ -7,7 +7,7 @@ const PLATFORM_RULES = {
   qianwen: {
     input: ['textarea', '[contenteditable="true"]', '.ant-input', '[placeholder*="输入"]'],
     send: ['button[type="submit"]', 'button[aria-label*="发送"]', 'button:has(svg)', '.ant-btn-primary', '[class*="send"]', '[class*="Submit"]'],
-    answer: ['.markdown-body', '.ant-typography', '[class*="message-content"]', '[class*="content"]', '[class*="assistant"]', '[class*="response"]', 'main'],
+    answer: ['.answer-common-card', '.qk-markdown', '.qk-md-paragraph', '.markdown-body', '.ant-typography', '[class*="message-content"]', '[class*="content"]', '[class*="assistant"]', '[class*="response"]', 'main'],
   },
   deepseek: {
     input: ['textarea', '[contenteditable="true"]'],
@@ -29,7 +29,7 @@ const PLATFORM_RULES = {
 const DEFAULT_SERVER_URL = "http://127.0.0.1:8765";
 const DEFAULT_PLATFORM_URLS = {
   doubao: "https://www.doubao.com/chat/",
-  qianwen: "https://tongyi.aliyun.com/qianwen/",
+  qianwen: "https://www.qianwen.com/",
   deepseek: "https://chat.deepseek.com/",
   yuanbao: "https://yuanbao.tencent.com/chat/",
   wenxin: "https://chat.baidu.com/?enter_type=yiyan_site",
@@ -49,6 +49,7 @@ const DEFAULT_PLATFORMS = Object.entries(DEFAULT_PLATFORM_URLS).map(([key, url])
 
 let GEO_LAST_ANSWER_ELEMENT = null;
 let GEO_LAST_ANSWER_DEBUG = null;
+let GEO_ACTIVE_KEYWORD_RANGE = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -410,6 +411,51 @@ function firstVisible(selectors) {
   return null;
 }
 
+function findWenxinInput() {
+  const selectors = [
+    "#input-root textarea",
+    '#input-root [contenteditable="true"]',
+    '#input-root [contenteditable="plaintext-only"]',
+    "#chat-input-home textarea",
+    '#chat-input-home [contenteditable="true"]',
+    '#chat-input-home [contenteditable="plaintext-only"]',
+    ".ci-root textarea",
+    '.ci-root [contenteditable="true"]',
+    '.ci-root [contenteditable="plaintext-only"]',
+  ];
+  const seen = new Set();
+  const candidates = [];
+  for (const selector of selectors) {
+    for (const input of document.querySelectorAll(selector)) {
+      if (seen.has(input)) continue;
+      seen.add(input);
+      if (input.disabled || input.getAttribute("aria-disabled") === "true") continue;
+      const rect = input.getBoundingClientRect();
+      if (rect.width < 80 || rect.height < 20) continue;
+      let score = 0;
+      if (input.closest("#input-root")) score += 500;
+      if (input.closest(".ci-root")) score += 300;
+      if (input.isContentEditable) score += 180;
+      if (input instanceof HTMLTextAreaElement) score += 160;
+      score += Math.max(0, rect.top) / 10;
+      score += Math.min(rect.width, 1200) / 20;
+      candidates.push({ input, score });
+    }
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates.length ? candidates[0].input : null;
+}
+
+async function waitForWenxinInput(timeoutMs = 5000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const input = findWenxinInput();
+    if (input) return input;
+    await sleep(100);
+  }
+  return null;
+}
+
 function visibleElements(selectors) {
   const elements = [];
   for (const selector of selectors) {
@@ -480,6 +526,26 @@ async function setInputValue(input, text) {
     await sleep(60);
     nativeSetValue(input, text);
     dispatchTextInputEvents(input, null);
+  }
+}
+
+async function setWenxinInputValue(input, text) {
+  input.focus();
+  let inserted = false;
+  if (input.isContentEditable) {
+    try {
+      document.execCommand("selectAll", false, null);
+      inserted = document.execCommand("insertText", false, text);
+    } catch (e) {}
+  }
+  if (!inserted) {
+    await setInputValue(input, text);
+  } else {
+    dispatchTextInputEvents(input, text);
+  }
+  await sleep(150);
+  if (getInputText(input) !== String(text).trim()) {
+    await setInputValue(input, text);
   }
 }
 
@@ -649,44 +715,107 @@ function findSendButton(input, platform) {
 }
 
 function findWenxinSendButton(input) {
-  const inputRect = input.getBoundingClientRect();
-  // 在输入框周围找按钮：文心一言的发送按钮通常在右下角或输入框右侧
-  const candidates = Array.from(document.querySelectorAll('button, [role="button"], [class*="send"], [class*="Send"], [class*="submit"], [class*="Submit"]'))
+  const candidates = Array.from(document.querySelectorAll(".ci-submit-button"))
     .filter((btn) => {
       if (btn.disabled || btn.getAttribute("aria-disabled") === "true") return false;
       const rect = btn.getBoundingClientRect();
       if (rect.width <= 8 || rect.height <= 8) return false;
-      // 靠近输入框：在输入框下方 0-200px 或右侧 0-200px
-      const nearInputBottom = rect.top >= inputRect.bottom - 10 && rect.top <= inputRect.bottom + 200;
-      const nearInputRight = rect.left >= inputRect.left && rect.left <= inputRect.right + 200;
-      const text = (btn.innerText || btn.textContent || btn.getAttribute("aria-label") || "").trim();
+      const text = `${btn.innerText || ""} ${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""} ${btn.title || ""}`.trim();
       const classList = String(btn.className || "");
-      if (/Tool|Deep Thinking|更多|快速|PPT|图片|视频|录音|编程|代码|Code|code|快捷键|\+|清空|重置/.test(text)) return false;
-      if (text.includes("发送") || text.includes("Send") || text.includes("send") || classList.includes("send") || classList.includes("Send")) return true;
-      // 如果按钮有 SVG 图标且在输入框附近，也是候选
-      if (btn.querySelector("svg") && (nearInputBottom || nearInputRight)) return true;
-      return false;
+      const isKnownWenxinSend =
+        btn.matches(".ci-submit-button") &&
+        Boolean(btn.querySelector("#ci-submit-button-ai, img.ci-submit-button-ai-active"));
+      if (!isKnownWenxinSend) return false;
+      if (/推荐|猜你|换一换|相关问题|Tool|Deep Thinking|更多|快速|PPT|图片|视频|录音|编程|代码|Code|快捷键|\+|清空|重置/.test(text)) return false;
+      return true;
     })
     .map((btn) => {
-      const rect = btn.getBoundingClientRect();
       let score = 0;
-      const text = (btn.innerText || btn.textContent || btn.getAttribute("aria-label") || "").trim();
-      if (text.includes("发送")) score += 200;
-      if (text.includes("Send") || text.includes("send")) score += 180;
-      if (btn.querySelector("svg")) score += 100;
-      if (String(btn.className || "").includes("send") || String(btn.className || "").includes("Send")) score += 150;
-      // 离输入框越近分越高
-      const distFromBottom = Math.abs(rect.top - inputRect.bottom);
-      const distFromRight = Math.abs(rect.left - inputRect.right);
-      score -= Math.min(distFromBottom, distFromRight) / 5;
+      const text = `${btn.innerText || ""} ${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""} ${btn.title || ""}`.trim();
+      const classList = String(btn.className || "");
+      if (btn.matches(".ci-submit-button") && btn.querySelector("#ci-submit-button-ai")) score += 1000;
+      if (btn.querySelector("img.ci-submit-button-ai-active")) score += 500;
+      if (/发送/.test(text)) score += 300;
+      if (/Send/i.test(text)) score += 260;
+      if (btn.getAttribute("type") === "submit") score += 240;
+      if (/(^|[-_\s])(send|submit)([-_\s]|$)/i.test(classList)) score += 220;
+      if (input.closest("form") && input.closest("form").contains(btn)) score += 180;
       return { button: btn, score };
     })
     .sort((a, b) => b.score - a.score);
-  
+
   return candidates.length ? candidates[0].button : null;
 }
 
-async function clickSendButton(input, platform) {
+async function waitForWenxinSendButton(input, timeoutMs = 5000) {
+  const started = Date.now();
+  let exactButton = null;
+  while (Date.now() - started < timeoutMs) {
+    exactButton = findWenxinSendButton(input);
+    if (exactButton) {
+      const icon = exactButton.querySelector("#ci-submit-button-ai");
+      if (icon && icon.classList.contains("ci-submit-button-ai-active")) {
+        return exactButton;
+      }
+    }
+    await sleep(100);
+  }
+  return exactButton;
+}
+
+function clickWenxinExactSendButton(button) {
+  const clickTarget = button.querySelector("#ci-submit-button-ai") || button;
+  button.scrollIntoView({ block: "center", inline: "center" });
+  clickTarget.focus?.();
+  const eventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: window,
+    button: 0,
+    buttons: 1,
+  };
+  try {
+    clickTarget.dispatchEvent(new PointerEvent("pointerdown", { ...eventInit, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+  } catch (e) {}
+  clickTarget.dispatchEvent(new MouseEvent("mousedown", eventInit));
+  try {
+    clickTarget.dispatchEvent(new PointerEvent("pointerup", { ...eventInit, buttons: 0, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+  } catch (e) {}
+  clickTarget.dispatchEvent(new MouseEvent("mouseup", { ...eventInit, buttons: 0 }));
+  clickTarget.click();
+}
+
+async function waitForInputCleared(input, timeoutMs = 1800) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (!getInputText(input).trim()) return true;
+    await sleep(100);
+  }
+  return false;
+}
+
+async function waitForWenxinSendAccepted(input, previousAnswerText, timeoutMs = 3200) {
+  const started = Date.now();
+  const previousNormalized = normalizeKeywordText(previousAnswerText || "");
+  while (Date.now() - started < timeoutMs) {
+    if (!getInputText(input).trim()) return true;
+    if (pageIsAnswerGenerating("wenxin")) return true;
+    const currentAnswer = getAnswerText("wenxin");
+    const currentNormalized = normalizeKeywordText(currentAnswer || "");
+    if (
+      currentNormalized &&
+      currentNormalized !== previousNormalized &&
+      Math.abs(currentNormalized.length - previousNormalized.length) >= 8
+    ) {
+      return true;
+    }
+    await sleep(100);
+  }
+  return false;
+}
+
+async function clickSendButton(input, platform, previousAnswerText = "") {
   // 千问：优先用 Enter 发送（千问的 textarea 支持 Enter 发送）
   if (platform === "qianwen") {
     pressEnterToSend(input);
@@ -699,28 +828,29 @@ async function clickSendButton(input, platform) {
 
   // 文心一言：使用专门的按钮查找
   if (platform === "wenxin") {
-    const wenxinBtn = findWenxinSendButton(input);
-    if (wenxinBtn) {
-      wenxinBtn.scrollIntoView({ block: "center" });
-      await sleep(200);
-      wenxinBtn.click();
-      await sleep(400);
-      const textAfter = getInputText(input);
-      if (!textAfter || textAfter.length === 0) return true;
+    const wenxinBtn = await waitForWenxinSendButton(input);
+    if (!wenxinBtn) {
+      throw new Error("文心没有找到明确的发送按钮：已禁止点击普通 SVG、推荐问题及使用 Enter 兜底。");
+    }
+    wenxinBtn.scrollIntoView({ block: "center", inline: "center" });
+    await sleep(200);
+    const mainWorldClick = await Promise.race([
+      runtimeMessage({ action: "WENXIN_CLICK_SEND_MAIN" }).catch(() => null),
+      sleep(3000).then(() => ({ ok: false, error: "文心主页面点击等待超过3秒" })),
+    ]);
+    if (!mainWorldClick || !mainWorldClick.ok) {
+      clickWenxinExactSendButton(wenxinBtn);
+    }
+    if (await waitForWenxinSendAccepted(input, previousAnswerText)) {
       return true;
     }
-    // 找不到按钮时，尝试多次点击常见位置
-    // 部分文心版本用 contenteditable 输入框，尝试用 submitInputForm
-    if (await submitInputForm(input)) {
-      await sleep(500);
+    // 文心部分版本不响应脚本 click，但输入框支持 Enter 提交。
+    // 只尝试一次，绝不重复按键，避免连发两个问题。
+    pressEnterToSend(input);
+    if (await waitForWenxinSendAccepted(input, previousAnswerText, 3500)) {
       return true;
     }
-    // 最后尝试 Enter（部分 textarea 版本支持）
-    pressEnterToSend(input);
-    await sleep(300);
-    pressEnterToSend(input);
-    await sleep(500);
-    return true;
+    throw new Error("文心精确发送按钮和单次 Enter 均未成功；为避免重复发送，任务已停止。");
   }
 
   const sendButton = findSendButton(input, platform);
@@ -739,16 +869,38 @@ async function clickSendButton(input, platform) {
 
 async function sendPrompt(platform, text) {
   const rules = PLATFORM_RULES[platform] || PLATFORM_RULES.doubao;
+  const previousAnswerText = platform === "wenxin" ? getAnswerText(platform) : "";
   if (platform === "qianwen") {
     await clearQianwenActiveModes();
   }
-  let input = firstVisible(rules.input);
+  let input = platform === "wenxin"
+    ? await waitForWenxinInput()
+    : firstVisible(rules.input);
   if (!input) throw new Error("找不到输入框，请先确认平台页面已登录并处于聊天页");
 
   if (platform === "qianwen") {
     input = await ensureQianwenChatMode(input, text);
   }
-  await setInputValue(input, text);
+  if (platform === "wenxin") {
+    const mainWorldWrite = await Promise.race([
+      runtimeMessage({ action: "WENXIN_SET_INPUT_MAIN", text: String(text || "") }).catch((error) => ({
+        ok: false,
+        error: String(error && error.message ? error.message : error),
+      })),
+      sleep(3000).then(() => ({ ok: false, error: "文心主页面写入等待超过3秒" })),
+    ]);
+    if (!mainWorldWrite || !mainWorldWrite.ok) {
+      await setWenxinInputValue(input, text);
+    }
+    input = await waitForWenxinInput(2000);
+    if (!input || getInputText(input) !== String(text).trim()) {
+      throw new Error(
+        `文心追问没有精确写入输入框：${mainWorldWrite && mainWorldWrite.error ? mainWorldWrite.error : "写入后校验失败"}`
+      );
+    }
+  } else {
+    await setInputValue(input, text);
+  }
   await sleep(500);
 
   if (platform === "qianwen") {
@@ -763,7 +915,7 @@ async function sendPrompt(platform, text) {
     }
   }
 
-  await clickSendButton(input, platform);
+  await clickSendButton(input, platform, previousAnswerText);
   await sleep(800);
   return true;
 }
@@ -773,22 +925,56 @@ function getAnswerCandidates(platform) {
   const seen = new Set();
   const candidates = [];
 
-  // 千问特殊处理：查找包含回答内容的容器
+  // 千问特殊处理：只读取聊天正文，绝不能把左侧历史会话算作回答。
   if (platform === "qianwen") {
-    const allTextBlocks = Array.from(document.querySelectorAll('[class*="message"], [class*="content"], [class*="answer"], [class*="response"], .ant-typography, .markdown-body, p, div'))
+    const qianwenSelectors = [
+      ".chat-answers-card-wrap",
+      ".answer-common-card",
+      "#qk-markdown-react",
+      ".qk-markdown",
+      ".qk-md-paragraph",
+      ".markdown-react",
+      ".markdown-body",
+      "main [class*='answer-card']",
+      "main [class*='AnswerCard']",
+      "main [class*='message-assistant']",
+      "main [class*='assistant-message']",
+      "main [class*='assistant']",
+      "main [class*='response']",
+      "main [class*='markdown']",
+      "main article",
+    ];
+    const excludedChrome = [
+      "aside",
+      "nav",
+      "header",
+      "[role='navigation']",
+      "[class*='history']",
+      "[class*='History']",
+      "[class*='session-list']",
+      "[class*='conversation-list']",
+      "[class*='recent-chat']",
+    ].join(",");
+    const allTextBlocks = Array.from(document.querySelectorAll(qianwenSelectors.join(",")))
       .filter((node) => {
         if (seen.has(node)) return false;
         seen.add(node);
         if (node.closest("#geo-auto-root")) return false;
-        if (isIgnoredLocateNode(node)) return false;
+        if (node.closest(excludedChrome)) return false;
+        // 页面级祖先可能同时包住 aside 和正文，不能把这种容器当回答。
+        if (node.querySelector("aside, nav, [role='navigation'], textarea, input, [contenteditable='true']")) return false;
+        // 千问主内容区的祖先也使用 bg-pc-sidebar 类名，不能套用通用
+        // isIgnoredLocateNode；这里已经通过 aside/nav 和位置单独排除左栏。
+        if (node.closest("script, style, noscript, button, [class*='composer'], [class*='toolbar'], [class*='footer']")) return false;
         const text = (node.innerText || node.textContent || "").trim();
         const rect = node.getBoundingClientRect();
         if (text.length <= 10 || rect.width <= 0 || rect.height <= 0) return false;
         // 排除输入框和用户消息区域
         const className = String(node.className || "");
         if (/send-msg|send-bubble|user-message|human-message|question|query|user/i.test(className) && !/answer|assistant|agent|markdown|response/i.test(className)) return false;
-        // 排除侧边栏、工具栏等
-        if (window.innerWidth > 900 && rect.right < window.innerWidth * 0.18) return false;
+        // 千问桌面端左栏约 256px；正文候选的左边缘必须位于内容区。
+        if (window.innerWidth > 900 && rect.left < Math.min(220, window.innerWidth * 0.16)) return false;
+        if (rect.width >= window.innerWidth * 0.94 && rect.height >= window.innerHeight * 0.8) return false;
         return true;
       });
     candidates.push(...allTextBlocks);
@@ -914,8 +1100,12 @@ function textFromNode(node) {
 }
 
 function getAnswerText(platform) {
-  return getAnswerCandidates(platform)
-    .slice(0, 8)
+  const candidates = getAnswerCandidates(platform);
+  // 千问候选中常同时存在回答卡片和其 markdown 子节点；只取评分最高的
+  // 当前回答，避免拼接页面级容器或历史内容造成误命中。
+  const limit = platform === "qianwen" ? 1 : 8;
+  return candidates
+    .slice(0, limit)
     .map(textFromNode)
     .filter(Boolean)
     .join("\n")
@@ -1057,7 +1247,11 @@ async function waitAnswerStable(task, previousText = "") {
       keywordSeen = containsAnyTargetKeyword(text, keywords);
       if (normalized && normalized !== previousNormalized && !transient) sawNewAnswer = true;
     }
-    const requiredStableMs = Math.max(stableMs, keywordSeen ? keywordStableMs : 0);
+    // 已经出现目标关键词时使用更短的关键词稳定窗口；旧逻辑取 max，
+    // 导致配置的 2 秒永远被普通 3 秒覆盖，命中后仍无意义地多等。
+    const requiredStableMs = keywordSeen
+      ? Math.max(800, Math.min(stableMs, keywordStableMs))
+      : stableMs;
     const candidate = findLatestAnswerElement(task.platform, previousText, lastText);
     const candidateText = textFromNode(candidate);
     const candidateLength = normalizeKeywordText(candidateText).length;
@@ -1085,7 +1279,10 @@ async function waitAnswerStable(task, previousText = "") {
 
 async function waitForFinalAnswerRender(task, fallbackText = "") {
   const pollMs = Math.max(300, Number(task.answer_poll_interval || 0.8) * 1000);
-  const settleMs = Math.max(3000, Number(task.answer_final_settle_seconds || 8) * 1000);
+  // waitAnswerStable 已经确认回答停止生成，这里只留一个短渲染缓冲，
+  // 避免每个平台在截图前固定再等待 8 秒。
+  const configuredSettleMs = Number(task.answer_final_settle_seconds || 2) * 1000;
+  const settleMs = Math.max(1200, Math.min(2500, configuredSettleMs));
   const minAnswerChars = Math.max(20, Number(task.answer_min_chars || 40));
   const timeoutMs = Math.max(settleMs + 3000, Number(task.answer_timeout_seconds || 90) * 1000);
   const started = Date.now();
@@ -1167,16 +1364,46 @@ function normalizeKeywordText(text) {
     .replace(/[，。！？、,.!?]/g, "");
 }
 
+function keywordCharsEquivalent(left, right) {
+  if (left === right) return true;
+  // 餐饮品牌中“某家/某记”经常是平台回答中的写法差异。
+  return (left === "家" && right === "记") || (left === "记" && right === "家");
+}
+
+function findLooseKeywordSpan(text, keyword) {
+  const haystack = normalizeKeywordText(text);
+  const needle = normalizeKeywordText(keyword);
+  if (!needle || !haystack) return null;
+
+  const exactIndex = haystack.indexOf(needle);
+  if (exactIndex >= 0) {
+    return { start: exactIndex, end: exactIndex + needle.length, exact: true };
+  }
+  // 短词做模糊匹配容易误判；至少 5 个有效字符才允许正文插入修饰词。
+  if (needle.length < 5) return null;
+
+  const maxExtra = Math.max(4, Math.floor(needle.length * 0.6));
+  for (let start = 0; start < haystack.length; start++) {
+    if (!keywordCharsEquivalent(haystack[start], needle[0])) continue;
+    let textIndex = start;
+    let keywordIndex = 0;
+    while (textIndex < haystack.length && keywordIndex < needle.length) {
+      if (keywordCharsEquivalent(haystack[textIndex], needle[keywordIndex])) keywordIndex++;
+      textIndex++;
+      if (textIndex - start > needle.length + maxExtra) break;
+    }
+    if (keywordIndex === needle.length) {
+      return { start, end: textIndex, exact: false };
+    }
+  }
+  return null;
+}
+
 function containsAnyTargetKeyword(text, keywords) {
-  const normalized = normalizeKeywordText(text || "");
-  if (!normalized) return false;
   const aliases = typeof keywordAliasesForPrompt === "function"
     ? keywordAliasesForPrompt(keywords)
     : splitKeywords(keywords);
-  return aliases.some((keyword) => {
-    const term = normalizeKeywordText(keyword);
-    return term && normalized.includes(term);
-  });
+  return aliases.some((keyword) => Boolean(findLooseKeywordSpan(text, keyword)));
 }
 
 function getKeywordContext(text, start, length, size = 15) {
@@ -1188,14 +1415,16 @@ function getKeywordContext(text, start, length, size = 15) {
 function getAnswerKeywordHit(answerText, keywords, judgeResult = null) {
   const text = String(answerText || "");
   for (const keyword of splitKeywords(keywords)) {
-    const index = text.indexOf(keyword);
-    if (index >= 0) {
+    const span = findLooseKeywordSpan(text, keyword);
+    if (span) {
+      const index = span.start;
       const prefixStart = Math.max(0, index - 15);
       return {
         keyword,
         index,
         prefix15: text.slice(prefixStart, index),
-        context: getKeywordContext(text, index, keyword.length, 15),
+        context: getKeywordContext(text, index, Math.max(keyword.length, span.end - span.start), 15),
+        match_type: span.exact ? "exact" : "ordered_fuzzy",
       };
     }
   }
@@ -1238,11 +1467,16 @@ function getAnswerKeywordHit(answerText, keywords, judgeResult = null) {
 }
 
 function isIgnoredLocateNode(node) {
+  const element = node && node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+  if (!element || !element.closest) return true;
+  if (isSidePanelKeywordNode(element)) return true;
   return Boolean(
-    node.closest(
+    element.closest(
       [
         "#geo-auto-root",
+        ".geo-matched-badge",
         ".geo-keyword-mark",
+        "[data-geo-overlay='1']",
         "script",
         "style",
         "noscript",
@@ -1253,8 +1487,6 @@ function isIgnoredLocateNode(node) {
         "nav",
         "aside",
         "[role='navigation']",
-        "[class*='sidebar']",
-        "[class*='Sidebar']",
         "[class*='history']",
         "[class*='History']",
         "[class*='composer']",
@@ -1271,6 +1503,56 @@ function isIgnoredLocateNode(node) {
         "[class*='Source']",
         "[class*='citation']",
         "[class*='Citation']",
+        "[class*='answer-ask']",
+      ].join(",")
+    )
+  );
+}
+
+// 豆包、元宝等站点的左侧历史标题可能与正文标题完全相同。即使左栏滚动
+// 容器已经被排除，若先选中了其中的文字，scrollIntoView 仍会把左栏滚动。
+// 因此在“文字候选”阶段也用语义和几何位置双重排除左侧栏。
+function isSidePanelKeywordNode(node) {
+  const element = node && node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+  if (!element || !element.closest) return true;
+  if (element.closest("nav, aside, [role='navigation']")) return true;
+  if (window.innerWidth <= 900) return false;
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0 &&
+    rect.left < window.innerWidth * 0.12 &&
+    rect.right <= window.innerWidth * 0.32;
+}
+
+// 千问的最终回答在不同版本里可能仍位于类名包含 thinking/source/input 的
+// 外层容器中。通用过滤器会把这种祖先下面的正文一并排除，造成“判断已命中，
+// 但正文 Range/坐标为空”。千问只排除明确的交互区、导航区和插件浮层。
+function isIgnoredQianwenKeywordNode(node) {
+  const element = node && node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+  if (!element || !element.closest) return true;
+  return Boolean(
+    element.closest(
+      [
+        "#geo-auto-root",
+        ".geo-matched-badge",
+        ".geo-keyword-mark",
+        "[data-geo-overlay='1']",
+        "script",
+        "style",
+        "noscript",
+        "textarea",
+        "input",
+        "button",
+        "[contenteditable='true']",
+        "nav",
+        "aside",
+        "[role='navigation']",
+        "[class*='history']",
+        "[class*='History']",
+        "[class*='composer']",
+        "[class*='toolbar']",
+        "[class*='footer']",
+        "[class*='suggest']",
+        "[class*='recommend']",
         "[class*='answer-ask']",
       ].join(",")
     )
@@ -1316,7 +1598,7 @@ function findRootByAnswerContext(answerHit) {
   return candidates.length ? candidates[0].node : null;
 }
 
-function findKeywordRangesInDOM(root, keyword) {
+function findKeywordRangesInDOM(root, keyword, ignoreNode = isIgnoredLocateNode) {
   if (!root || !keyword) return [];
 
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -1325,7 +1607,7 @@ function findKeywordRangesInDOM(root, keyword) {
 
   while (walker.nextNode()) {
     const node = walker.currentNode;
-    if (!node.parentElement || isIgnoredLocateNode(node.parentElement)) continue;
+    if (!node.parentElement || ignoreNode(node.parentElement)) continue;
     const raw = node.nodeValue || "";
     const normalized = normalizeKeywordText(raw);
 
@@ -1349,6 +1631,53 @@ function findKeywordRangesInDOM(root, keyword) {
     }
   }
 
+  if (results.length) return results;
+
+  // 千问会把一个词拆进多个 span/text node。逐节点搜索无法命中这种正文，
+  // 因此在快速路径失败后，建立跨文本节点的字符坐标并生成一个跨节点 Range。
+  const rootText = normalizeKeywordText(root.textContent || "");
+  if (!keywordNormalized || !findLooseKeywordSpan(rootText, keywordNormalized)) return results;
+
+  const crossWalker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const normalizedChars = [];
+  const positions = [];
+  const ignoredChar = /\s|[，。！？、,.!?]/;
+  while (crossWalker.nextNode() && normalizedChars.length < 200000) {
+    const node = crossWalker.currentNode;
+    if (!node.parentElement || ignoreNode(node.parentElement)) continue;
+    const raw = node.nodeValue || "";
+    for (let offset = 0; offset < raw.length; offset++) {
+      if (ignoredChar.test(raw[offset])) continue;
+      normalizedChars.push(raw[offset]);
+      positions.push({ node, offset });
+    }
+  }
+
+  const flattened = normalizedChars.join("");
+  let searchFrom = 0;
+  while (searchFrom < flattened.length) {
+    const span = findLooseKeywordSpan(flattened.slice(searchFrom), keywordNormalized);
+    if (!span) break;
+    const spanStart = searchFrom + span.start;
+    const spanEnd = searchFrom + span.end;
+    const start = positions[spanStart];
+    const end = positions[spanEnd - 1];
+    if (start && end) {
+      const range = document.createRange();
+      range.setStart(start.node, start.offset);
+      range.setEnd(end.node, Math.min((end.node.nodeValue || "").length, end.offset + 1));
+      results.push({
+        range,
+        node: start.node,
+        keyword,
+        matched_text: flattened.slice(spanStart, spanEnd),
+        context: getKeywordContext(root.textContent || "", Math.max(0, spanStart), keyword.length),
+        source: span.exact ? "cross_node_text" : "cross_node_fuzzy_text",
+      });
+    }
+    searchFrom = Math.max(spanStart + 1, spanEnd);
+  }
+
   return results;
 }
 
@@ -1363,12 +1692,23 @@ function findCharIndexByNormalizedIndex(raw, normalizedIndex) {
   return raw.length;
 }
 
+function isSidePanelScrollContainer(node) {
+  if (!node || node === document.body || node === document.documentElement || node === document.scrollingElement) return false;
+  if (node.closest && node.closest("nav, aside, [role='navigation']")) return true;
+  const className = String(node.className || "");
+  if (/sidebar|side-bar|history|conversation-list|session-list|nav-list/i.test(className)) return true;
+  if (window.innerWidth <= 900) return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.width <= 380 && rect.left < window.innerWidth * 0.12 && rect.right <= window.innerWidth * 0.32;
+}
+
 function scrollableContainers(root = document.body) {
   const base = root && document.body.contains(root) ? root : document.body;
   const nodes = [document.scrollingElement || document.documentElement, ...Array.from(base.querySelectorAll("*"))];
   return uniqueNodes(nodes.filter((node) => {
     if (!node || node.nodeType !== 1) return false;
     if (isIgnoredLocateNode(node)) return false;
+    if (isSidePanelScrollContainer(node)) return false;
     const style = window.getComputedStyle(node);
     const canScrollY = /(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflow}`);
     if (!canScrollY && node !== document.scrollingElement && node !== document.documentElement) return false;
@@ -1380,7 +1720,7 @@ function nearestScrollableContainer(element) {
   let node = element && element.nodeType === Node.TEXT_NODE ? element.parentElement : element;
   while (node && node !== document.body && node !== document.documentElement) {
     const style = window.getComputedStyle(node);
-    if (/(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflow}`) && node.scrollHeight > node.clientHeight + 40) {
+    if (!isSidePanelScrollContainer(node) && /(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflow}`) && node.scrollHeight > node.clientHeight + 40) {
       return node;
     }
     node = node.parentElement;
@@ -1390,6 +1730,7 @@ function nearestScrollableContainer(element) {
 
 function scrollContainerToCenter(container, rect) {
   if (!container || !rect) return;
+  if (isSidePanelScrollContainer(container)) return;
   if (container === document.scrollingElement || container === document.documentElement || container === document.body) {
     const targetTop = window.scrollY + rect.top - window.innerHeight / 2 + rect.height / 2;
     window.scrollTo(0, Math.max(0, targetTop));
@@ -1402,6 +1743,7 @@ function scrollContainerToCenter(container, rect) {
 
 function scrollContainerToCenterSmooth(container, rect) {
   if (!container || !rect) return;
+  if (isSidePanelScrollContainer(container)) return;
   if (container === document.scrollingElement || container === document.documentElement || container === document.body) {
     const targetTop = window.scrollY + rect.top - window.innerHeight * 0.45 + rect.height / 2;
     window.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
@@ -1414,6 +1756,16 @@ function scrollContainerToCenterSmooth(container, rect) {
 
 function targetRectForKeywordMatch(match) {
   if (!match || !match.range) return null;
+  // getBoundingClientRect 是整个跨节点 Range 的并集；千问经常把品牌、修饰词、
+  // 菜名拆成多个 span，不能只取第一个 client rect，否则只会框到“老街杨家”。
+  const preciseRect = match.range.getBoundingClientRect();
+  if (
+    preciseRect && preciseRect.width > 0 && preciseRect.height > 0 &&
+    preciseRect.top >= 0 && preciseRect.bottom <= window.innerHeight &&
+    preciseRect.height <= window.innerHeight * 0.35
+  ) {
+    return preciseRect;
+  }
   const start = match.range.startContainer;
   const element = start && start.nodeType === Node.TEXT_NODE ? start.parentElement : start;
   if (!element) return bestRangeRect(match.range);
@@ -1442,7 +1794,7 @@ async function waitForScrollStable(timeoutMs = 3000, container = null) {
     const current = scrollSnapshot(container);
     if (Math.abs(current.windowY - last.windowY) < 5 && Math.abs(current.targetTop - last.targetTop) < 5) {
       stableCount++;
-      if (stableCount >= 5) return true;
+      if (stableCount >= 3) return true;
     } else {
       stableCount = 0;
     }
@@ -1583,13 +1935,17 @@ function drawDOMKeywordBoxes(ranges) {
   clearKeywordMarks();
 
   const rects = [];
-  for (const item of ranges.slice(0, 3)) {
-    const rangeRect = bestRangeRect(item.range);
-    const keywordRects = drawBoxFromRect(rangeRect, 8);
-    if (keywordRects.length) {
-      rects.push(...keywordRects);
-      continue;
+  // 只标注回答正文中第一处最可信命中。旧逻辑最多画三处，商品卡、引用
+  // 和正文重复出现目标词时会产生多个看似“框偏了”的标注。
+  for (const item of ranges.slice(0, 1)) {
+    const rangeRects = Array.from(item.range.getClientRects ? item.range.getClientRects() : [])
+      .filter((rect) => rect.width > 0 && rect.height > 0)
+      .slice(0, 3);
+    for (const rangeRect of rangeRects) {
+      const keywordRects = drawBoxFromRect(rangeRect, 4);
+      if (keywordRects.length) rects.push(...keywordRects);
     }
+    if (rects.length) continue;
 
     const target = markerTargetForRange(item.range);
     if (target) {
@@ -1608,6 +1964,7 @@ function drawMatchedBadge(matchedKeywords) {
 
   const badge = document.createElement("div");
   badge.className = "geo-matched-badge";
+  badge.dataset.geoOverlay = "1";
   badge.textContent = `命中：${matchedKeywords.join("、")}`;
   Object.assign(badge.style, {
     position: "fixed",
@@ -1665,6 +2022,7 @@ function scrollKeywordToCenter(range) {
   const start = range.startContainer;
   const element = start.nodeType === Node.TEXT_NODE ? start.parentElement : start;
   if (!element) return false;
+  if (isIgnoredLocateNode(element) || isSidePanelKeywordNode(element)) return false;
 
   const container = nearestScrollableContainer(element);
   if (element.scrollIntoView) {
@@ -1689,6 +2047,7 @@ async function smoothScrollKeywordToCenter(range, waitMs = 3600) {
   const start = range && range.startContainer;
   const element = start && start.nodeType === Node.TEXT_NODE ? start.parentElement : start;
   if (!element) return false;
+  if (isIgnoredLocateNode(element) || isSidePanelKeywordNode(element)) return false;
 
   const container = nearestScrollableContainer(element);
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -1832,14 +2191,120 @@ async function findKeywordWithNativeFind(searchTerms, preferredRoot = null) {
   return [];
 }
 
+async function findQianwenKeywordWithNativeFind(searchTerms) {
+  const selection = window.getSelection && window.getSelection();
+  if (!selection || typeof window.find !== "function") return [];
+
+  const answerRoot = GEO_LAST_ANSWER_ELEMENT && document.body.contains(GEO_LAST_ANSWER_ELEMENT)
+    ? GEO_LAST_ANSWER_ELEMENT
+    : null;
+
+  const allTerms = uniqueList(searchTerms).filter((term) => String(term || "").trim().length >= 2);
+
+  for (const term of allTerms) {
+    selection.removeAllRanges();
+    const termStr = String(term);
+
+    for (let attempt = 0; attempt < 80; attempt++) {
+      if (attempt === 40) {
+        selection.removeAllRanges();
+        window.scrollTo({ top: 0, behavior: "instant" });
+        await waitForScrollStable(1500);
+      }
+
+      const found = window.find(termStr, false, false, true, false, true, false);
+      if (!found || selection.rangeCount === 0) break;
+
+      const range = selection.getRangeAt(0);
+      const container = range.commonAncestorContainer.nodeType === Node.TEXT_NODE
+        ? range.commonAncestorContainer.parentElement
+        : range.commonAncestorContainer;
+      if (!container) continue;
+
+      if (isIgnoredQianwenKeywordNode(container)) continue;
+
+      if (answerRoot && !answerRoot.contains(container) && !container.contains(answerRoot)) {
+        continue;
+      }
+
+      let positionedAncestor = container;
+      let isOverlay = false;
+      while (positionedAncestor && positionedAncestor !== document.body) {
+        const pos = window.getComputedStyle(positionedAncestor).position;
+        if (pos === "fixed" || pos === "sticky") { isOverlay = true; break; }
+        positionedAncestor = positionedAncestor.parentElement;
+      }
+      if (isOverlay) continue;
+
+      const rect = bestRangeRect(range);
+      if (!rect.width || !rect.height) continue;
+      if (rect.bottom <= 0 || rect.top >= window.innerHeight) continue;
+
+      scrollKeywordToCenter(range);
+      await waitForScrollStable(1800, nearestScrollableContainer(container));
+
+      const finalRect = bestRangeRect(range);
+      if (!finalRect.width || !finalRect.height) continue;
+
+      return [{
+        range,
+        node: range.startContainer,
+        keyword: termStr,
+        context: getKeywordContext(
+          range.startContainer.nodeValue || container.innerText || "",
+          0,
+          termStr.length
+        ),
+        source: "qianwen_native_find",
+      }];
+    }
+    selection.removeAllRanges();
+  }
+
+  return [];
+}
+
+let _qianwenSelectionStyleEl = null;
+
+function applyQianwenSelectionHighlight() {
+  if (_qianwenSelectionStyleEl) return;
+  const style = document.createElement("style");
+  style.id = "geo-qianwen-selection-highlight";
+  style.textContent = [
+    "::selection { background: rgba(255, 0, 0, 0.35) !important; color: inherit !important; }",
+    "::-moz-selection { background: rgba(255, 0, 0, 0.35) !important; color: inherit !important; }",
+    ".geo-qianwen-highlight { background: rgba(255, 0, 0, 0.18) !important; border: 2px solid #ff0000 !important; border-radius: 2px; }",
+  ].join("\n");
+  document.documentElement.appendChild(style);
+  _qianwenSelectionStyleEl = style;
+}
+
+function removeQianwenSelectionHighlight() {
+  if (_qianwenSelectionStyleEl) {
+    _qianwenSelectionStyleEl.remove();
+    _qianwenSelectionStyleEl = null;
+  }
+  const sel = window.getSelection && window.getSelection();
+  if (sel) sel.removeAllRanges();
+}
+
 function qianwenKeywordNodeScore(node, term) {
-  if (!node || isIgnoredLocateNode(node)) return null;
+  if (!node || isIgnoredQianwenKeywordNode(node)) return null;
   if (node.querySelector && node.querySelector("textarea, input, [contenteditable='true']")) return null;
+
+  // 千问定位只能命中回答正文。插件自身的固定提示层（例如右上角“命中”徽标）
+  // 也包含目标词，若不排除会被误判成答案中的第一个命中位置。
+  let positionedAncestor = node;
+  while (positionedAncestor && positionedAncestor !== document.body) {
+    const positionedStyle = window.getComputedStyle(positionedAncestor);
+    if (positionedStyle.position === "fixed" || positionedStyle.position === "sticky") return null;
+    positionedAncestor = positionedAncestor.parentElement;
+  }
 
   const text = node.innerText || node.textContent || "";
   const normalized = normalizeKeywordText(text);
   const normalizedTerm = normalizeKeywordText(term);
-  if (!normalizedTerm || !normalized.includes(normalizedTerm)) return null;
+  if (!normalizedTerm || !findLooseKeywordSpan(normalized, normalizedTerm)) return null;
 
   const rect = node.getBoundingClientRect();
   if (!rect.width || !rect.height) return null;
@@ -1861,6 +2326,8 @@ function qianwenKeywordNodeScore(node, term) {
   score -= Math.max(0, rect.width * rect.height - window.innerWidth * window.innerHeight * 0.45) / 2500;
   score += Math.max(0, rect.left - window.innerWidth * 0.18) / 100;
   score += Math.max(0, rect.top + window.scrollY) / 5000;
+  // 同一段同时命中简称和完整目标词时，必须优先框完整目标词。
+  score += normalizedTerm.length * 30;
   return score;
 }
 
@@ -1879,7 +2346,7 @@ function findQianwenKeywordMatches(searchTerms) {
       for (const term of uniqueList(searchTerms)) {
         const score = qianwenKeywordNodeScore(node, term);
         if (score === null) continue;
-        const matches = findKeywordRangesInDOM(node, term);
+        const matches = findKeywordRangesInDOM(node, term, isIgnoredQianwenKeywordNode);
         if (!matches.length) continue;
         candidates.push({ matches, score, node, term });
       }
@@ -1894,15 +2361,19 @@ async function findQianwenKeywordMatchesByScroll(searchTerms) {
   let matches = findQianwenKeywordMatches(searchTerms);
   if (matches.length) return matches;
 
-  const containers = uniqueNodes(scrollableContainers(document.body));
+  // 千问是虚拟滚动页面，只检查最可能的三个主滚动容器，避免遍历页面
+  // 每一个可滚动小组件并在每个位置等待近一秒。
+  const containers = uniqueNodes(scrollableContainers(document.body))
+    .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))
+    .slice(0, 3);
   for (const container of containers) {
     const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
     const step = Math.max(260, Math.floor((container.clientHeight || window.innerHeight) * 0.55));
     const positions = uniqueList([container.scrollTop || 0, 0, ...Array.from({ length: Math.ceil(maxScroll / step) + 1 }, (_, i) => i * step), maxScroll])
       .map((value) => Math.max(0, Math.min(maxScroll, Math.round(Number(value) || 0))));
-    for (const top of positions) {
+    for (const top of positions.slice(0, 10)) {
       container.scrollTo({ top, behavior: "instant" });
-      await waitForScrollStable(900, container);
+      await waitForScrollStable(600, container);
       matches = findQianwenKeywordMatches(searchTerms);
       if (matches.length) return matches;
     }
@@ -1912,9 +2383,9 @@ async function findQianwenKeywordMatchesByScroll(searchTerms) {
   const step = Math.max(300, Math.floor(window.innerHeight * 0.55));
   const positions = uniqueList([window.scrollY, 0, ...Array.from({ length: Math.ceil(maxScroll / step) + 1 }, (_, i) => i * step), maxScroll])
     .map((value) => Math.max(0, Math.min(maxScroll, Math.round(Number(value) || 0))));
-  for (const top of positions) {
+  for (const top of positions.slice(0, 10)) {
     window.scrollTo({ top, behavior: "instant" });
-    await waitForScrollStable(900);
+    await waitForScrollStable(600);
     matches = findQianwenKeywordMatches(searchTerms);
     if (matches.length) return matches;
   }
@@ -2037,22 +2508,24 @@ async function locateKeywordByAnswerText(answerText, keywords, judgeResult = nul
   }
 
   if (!matches.length) {
-    matches = await findKeywordWithNativeFind(searchTerms, targetRoot);
-  }
-
-  if (!matches.length) {
+    // 非千问平台禁止 window.find：浏览器会先把左侧历史栏里的同名会话
+    // 滚入视口，再由代码判断它不是正文，造成“滑的是左边框”的现象。
+    // 直接在回答根节点内做 DOM Range + 正文容器滚动。
     matches = await findKeywordMatchesByScroll(searchTerms, targetRoot);
   }
   if (!matches.length) return { matched: false };
 
   const firstMatch = matches[0];
-  const rects = await drawKeywordAndEnsureViewport(firstMatch);
-  const firstRect = document.querySelector(".geo-keyword-mark")?.getBoundingClientRect() || firstMatch.range.getBoundingClientRect();
+  await drawKeywordAndEnsureViewport(firstMatch);
+  // 返回关键词 Range 自身的坐标，不返回带 padding 的网页覆盖层坐标。
+  const exactRects = Array.from(firstMatch.range.getClientRects ? firstMatch.range.getClientRects() : [])
+    .filter((rect) => rect.width > 0 && rect.height > 0);
+  const firstRect = bestRangeRect(firstMatch.range);
 
   return {
     matched: true,
     matched_keywords: [answerHit.reportedKeyword || answerHit.keyword],
-    rects: rects.map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height })),
+    rects: exactRects.map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height })),
     first_rect: {
       x: firstRect.x,
       y: firstRect.y,
@@ -2090,29 +2563,59 @@ function keywordMarkFullyInViewport(margin = 8) {
   });
 }
 
+function keywordRectNearViewportCenter(rect, band = 0.24) {
+  if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+  const centerY = Number(rect.y !== undefined ? rect.y : rect.top) + rect.height / 2;
+  const viewportCenterY = window.innerHeight / 2;
+  return Math.abs(centerY - viewportCenterY) <= window.innerHeight * band;
+}
+
+async function centerKeywordRangePrecisely(range, attempts = 3) {
+  if (!range) return null;
+  const start = range.startContainer;
+  const element = start && start.nodeType === Node.TEXT_NODE ? start.parentElement : start;
+  if (!element || isIgnoredLocateNode(element) || isSidePanelKeywordNode(element)) return null;
+  const container = nearestScrollableContainer(range.startContainer);
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    let rect = bestRangeRect(range);
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    scrollContainerToCenter(container, rect);
+    await waitForScrollStable(900, container);
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    rect = bestRangeRect(range);
+    const fullyVisible = rect.top >= 8 && rect.left >= 8 &&
+      rect.bottom <= window.innerHeight - 8 && rect.right <= window.innerWidth - 8;
+    if (fullyVisible && keywordRectNearViewportCenter(rect)) return rect;
+  }
+  return bestRangeRect(range);
+}
+
 async function drawKeywordAndEnsureViewport(match) {
-  scrollKeywordToCenter(match.range);
-  await waitForScrollStable();
+  GEO_ACTIVE_KEYWORD_RANGE = match && match.range ? match.range : null;
+  await centerKeywordRangePrecisely(match.range, 3);
   let rects = drawDOMKeywordBoxes([match]);
-  if (!keywordMarkFullyInViewport()) {
-    scrollKeywordToCenter(match.range);
-    await waitForScrollStable();
+  const exactRect = bestRangeRect(match.range);
+  if (!keywordMarkFullyInViewport() || !keywordRectNearViewportCenter(exactRect)) {
+    await centerKeywordRangePrecisely(match.range, 3);
     rects = drawDOMKeywordBoxes([match]);
   }
   return rects;
 }
 
 async function drawKeywordAndEnsureViewportSmooth(match) {
-  await smoothScrollKeywordToCenter(match.range, 4200);
-  await forceCenterQianwenMatch(match, 1400);
-  let rects = drawDOMKeywordBoxes([match]);
+  GEO_ACTIVE_KEYWORD_RANGE = match && match.range ? match.range : null;
+  scrollKeywordToCenter(match.range);
+  await waitForScrollStable(800, nearestScrollableContainer(match.range.startContainer));
+  await forceCenterQianwenMatch(match, 700);
+  clearKeywordMarks();
+  let rects = drawBoxFromRect(targetRectForKeywordMatch(match), 8);
   await new Promise((resolve) => requestAnimationFrame(resolve));
   await sleep(220);
   if (!keywordMarkFullyInViewport()) {
     clearKeywordMarks();
-    await smoothScrollKeywordToCenter(match.range, 4200);
-    await forceCenterQianwenMatch(match, 1400);
-    rects = drawDOMKeywordBoxes([match]);
+    scrollKeywordToCenter(match.range);
+    await waitForScrollStable(800, nearestScrollableContainer(match.range.startContainer));
+    rects = drawBoxFromRect(targetRectForKeywordMatch(match), 8);
     await sleep(220);
   }
   return rects;
@@ -2122,17 +2625,16 @@ async function locateAndMarkAnswerKeyword(answerText, matchedKeywords, judgeResu
   let domLocation = await locateKeywordByAnswerText(answerText, matchedKeywords, judgeResult);
   if (!domLocation.matched || !visibleKeywordMarkExists()) {
     const answerRoot = GEO_LAST_ANSWER_ELEMENT && document.body.contains(GEO_LAST_ANSWER_ELEMENT) ? GEO_LAST_ANSWER_ELEMENT : null;
-    let scrollMatches = await findKeywordWithNativeFind(matchedKeywords.slice(0, 1), answerRoot);
-    if (!scrollMatches.length) {
-      scrollMatches = await findKeywordMatchesByScroll(matchedKeywords.slice(0, 1), answerRoot);
-    }
+    const scrollMatches = await findKeywordMatchesByScroll(matchedKeywords.slice(0, 1), answerRoot);
     if (scrollMatches.length) {
-      const rects = await drawKeywordAndEnsureViewport(scrollMatches[0]);
-      const firstRect = document.querySelector(".geo-keyword-mark")?.getBoundingClientRect() || scrollMatches[0].range.getBoundingClientRect();
+      await drawKeywordAndEnsureViewport(scrollMatches[0]);
+      const exactRects = Array.from(scrollMatches[0].range.getClientRects ? scrollMatches[0].range.getClientRects() : [])
+        .filter((rect) => rect.width > 0 && rect.height > 0);
+      const firstRect = bestRangeRect(scrollMatches[0].range);
       domLocation = {
         matched: true,
         matched_keywords: [scrollMatches[0].keyword],
-        rects: rects.map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height })),
+        rects: exactRects.map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height })),
         first_rect: { x: firstRect.x, y: firstRect.y, width: firstRect.width, height: firstRect.height },
         context: scrollMatches[0].context,
         match_type: "scroll_scan",
@@ -2164,8 +2666,52 @@ function keywordSearchTerms(matchedKeywords, judgeResult, keywords = []) {
   ]).filter((term) => String(term || "").trim().length >= 2);
 }
 
+function renderedAnswerKeywordHit(platform, keywords) {
+  const targetKeywords = splitKeywords(keywords);
+  const searchTerms = uniqueList(targetKeywords.flatMap((keyword) => (
+    typeof keywordAliasesForPrompt === "function"
+      ? keywordAliasesForPrompt([keyword])
+      : [keyword]
+  ))).filter((term) => String(term || "").trim().length >= 2);
+  if (!searchTerms.length) return null;
+
+  let matches = [];
+  if (platform === "qianwen") {
+    // 千问提取 answerText 偶尔只拿到部分段落；追问前直接检查实际渲染的
+    // 回答正文，命中后立即停止，不能继续依赖不完整的文本提取结果。
+    matches = findQianwenKeywordMatches(searchTerms);
+  } else {
+    const answerRoot = GEO_LAST_ANSWER_ELEMENT && document.body.contains(GEO_LAST_ANSWER_ELEMENT)
+      ? GEO_LAST_ANSWER_ELEMENT
+      : document.body;
+    matches = findFirstKeywordMatches(searchTerms, answerRoot);
+  }
+  if (!matches.length) return null;
+
+  const matchedAlias = String(matches[0].keyword || "").trim();
+  const canonicalKeyword = targetKeywords.find((keyword) => {
+    const aliases = typeof keywordAliasesForPrompt === "function"
+      ? keywordAliasesForPrompt([keyword])
+      : [keyword];
+    return aliases.some((alias) => normalizeKeywordText(alias) === normalizeKeywordText(matchedAlias));
+  }) || targetKeywords[0] || matchedAlias;
+
+  return {
+    ok: true,
+    has_answer: true,
+    matched: true,
+    keyword: canonicalKeyword,
+    matched_text: matchedAlias || canonicalKeyword,
+    match_type: "rendered_answer_dom",
+    confidence: 1,
+    source: "browser_dom_guard",
+    reason: "页面实际渲染的回答正文已出现当前行目标关键词，追问前强制停止",
+  };
+}
+
 async function locateAndMarkKeywordForScreenshot(platform, answerText, matchedKeywords, judgeResult, keywords) {
-  const searchTerms = keywordSearchTerms(matchedKeywords, judgeResult, keywords);
+  const searchTerms = keywordSearchTerms(matchedKeywords, judgeResult, keywords)
+    .sort((left, right) => normalizeKeywordText(right).length - normalizeKeywordText(left).length);
   clearKeywordMarks();
 
   if (platform === "qianwen") {
@@ -2184,7 +2730,7 @@ async function locateAndMarkKeywordForScreenshot(platform, answerText, matchedKe
           rects: rects.map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height })),
           first_rect: { x: firstRect.x, y: firstRect.y, width: firstRect.width, height: firstRect.height },
           context: matches[0].context,
-          needs_image_annotation: true,
+          needs_image_annotation: false,
           match_type: matches[0].source || "qianwen_precise_keyword",
         };
       }
@@ -2196,12 +2742,12 @@ async function locateAndMarkKeywordForScreenshot(platform, answerText, matchedKe
           ? { x: firstRect.x, y: firstRect.y, width: firstRect.width, height: firstRect.height }
           : null,
         context: matches[0].context,
-        needs_ocr_annotation: true,
+        needs_image_annotation: true,
         match_type: "qianwen_keyword_scrolled_for_ocr",
       };
     }
     clearKeywordMarks();
-    return { matched: false, needs_ocr_annotation: true, match_type: "qianwen_keyword_not_visible" };
+    return { matched: false, needs_image_annotation: true, match_type: "qianwen_keyword_not_visible" };
   }
 
   return locateAndMarkAnswerKeyword(answerText, matchedKeywords, judgeResult);
@@ -2220,7 +2766,9 @@ async function captureVisibleScreenshot() {
 }
 
 async function annotateScreenshotDataUrl(dataUrl, rect) {
-  if (!dataUrl || !rect || rect.width <= 0 || rect.height <= 0) return dataUrl;
+  const inputRects = (Array.isArray(rect) ? rect : [rect])
+    .filter((item) => item && item.width > 0 && item.height > 0);
+  if (!dataUrl || !inputRects.length) return dataUrl;
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
@@ -2232,16 +2780,17 @@ async function annotateScreenshotDataUrl(dataUrl, rect) {
 
       const scaleX = canvas.width / window.innerWidth;
       const scaleY = canvas.height / window.innerHeight;
-      const left = Math.max(8, rect.x - 10) * scaleX;
-      const top = Math.max(8, rect.y - 10) * scaleY;
-      const right = Math.min(window.innerWidth - 8, rect.x + rect.width + 10) * scaleX;
-      const bottom = Math.min(window.innerHeight - 8, rect.y + rect.height + 10) * scaleY;
-
       ctx.lineWidth = Math.max(4, Math.round(4 * Math.min(scaleX, scaleY)));
       ctx.strokeStyle = "#ff0000";
       ctx.fillStyle = "rgba(255, 0, 0, 0.06)";
-      ctx.fillRect(left, top, Math.max(24, right - left), Math.max(20, bottom - top));
-      ctx.strokeRect(left, top, Math.max(24, right - left), Math.max(20, bottom - top));
+      for (const item of inputRects.slice(0, 3)) {
+        const left = Math.max(8, item.x - 4) * scaleX;
+        const top = Math.max(8, item.y - 4) * scaleY;
+        const right = Math.min(window.innerWidth - 8, item.x + item.width + 4) * scaleX;
+        const bottom = Math.min(window.innerHeight - 8, item.y + item.height + 4) * scaleY;
+        ctx.fillRect(left, top, Math.max(24, right - left), Math.max(20, bottom - top));
+        ctx.strokeRect(left, top, Math.max(24, right - left), Math.max(20, bottom - top));
+      }
       resolve(canvas.toDataURL("image/png"));
     };
     img.onerror = () => resolve(dataUrl);
@@ -2255,6 +2804,39 @@ async function prepareForScreenshot() {
   const activeEl = document.activeElement;
   if (activeEl) activeEl.blur();
   await sleep(300);
+}
+
+async function waitForKeywordRectStable(range, timeoutMs = 1800) {
+  if (!range) return null;
+  const started = Date.now();
+  let last = null;
+  let stableCount = 0;
+  while (Date.now() - started < timeoutMs) {
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    await sleep(80);
+    let rect = null;
+    try {
+      rect = bestRangeRect(range);
+    } catch (_) {
+      return null;
+    }
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    const current = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    if (
+      last &&
+      Math.abs(current.x - last.x) < 1 &&
+      Math.abs(current.y - last.y) < 1 &&
+      Math.abs(current.width - last.width) < 1 &&
+      Math.abs(current.height - last.height) < 1
+    ) {
+      stableCount++;
+      if (stableCount >= 3) return current;
+    } else {
+      stableCount = 0;
+    }
+    last = current;
+  }
+  return last;
 }
 
 function cleanupAfterScreenshot() {
@@ -2275,6 +2857,8 @@ function keywordAliasesForPrompt(keywords) {
     aliases.add(keyword);
     if (keyword.startsWith("贵阳")) aliases.add(`贵州${keyword.slice(2)}`);
     if (keyword.startsWith("贵州")) aliases.add(`贵阳${keyword.slice(2)}`);
+    if (keyword.includes("杨家")) aliases.add(keyword.replace("杨家", "杨记"));
+    if (keyword.includes("杨记")) aliases.add(keyword.replace("杨记", "杨家"));
     if (/商学院/.test(keyword)) {
       aliases.add("贵商");
       aliases.add(keyword.replace("商学院", "商院"));
@@ -2371,6 +2955,31 @@ async function buildSmartFollowupPrompt(followupCount, keywords, previousQuestio
 }
 
 async function judgeAnswer(answerText, keywords, task) {
+  const normalizedAnswer = normalizeKeywordText(answerText || "");
+  for (const keyword of splitKeywords(keywords)) {
+    const aliases = typeof keywordAliasesForPrompt === "function"
+      ? keywordAliasesForPrompt([keyword])
+      : [keyword];
+    const matched = aliases
+      .map((alias) => ({ alias, span: findLooseKeywordSpan(normalizedAnswer, alias) }))
+      .find((item) => item.span);
+    if (matched) {
+      return {
+        ok: true,
+        has_answer: normalizedAnswer.length >= 20,
+        matched: true,
+        keyword,
+        matched_text: normalizedAnswer.slice(matched.span.start, matched.span.end) || matched.alias,
+        match_type: matched.span.exact ? "browser_direct_text" : "browser_fuzzy_text",
+        confidence: 1,
+        source: "browser_direct",
+        reason: matched.span.exact
+          ? "回答正文已直接出现当前行目标关键词，立即停止追问"
+          : "回答正文出现带修饰词或品牌写法变体的目标关键词，立即停止追问",
+      };
+    }
+  }
+
   const response = await runtimeMessage({
     action: "JUDGE_ANSWER",
     answer_text: answerText || "",
@@ -2392,6 +3001,7 @@ async function judgeAnswer(answerText, keywords, task) {
 async function runPlatformTask(task) {
   clearKeywordMarks();
   clearMatchedBadges();
+  GEO_ACTIVE_KEYWORD_RANGE = null;
   let answerText = "";
   let matched = false;
   let matchedKeywords = [];
@@ -2406,6 +3016,9 @@ async function runPlatformTask(task) {
   await sendPrompt(task.platform, task.question);
   answerText = await waitAnswerStable(task, previousText);
   judgeResult = await judgeAnswer(answerText, keywords, task);
+  if (!judgeResult.matched) {
+    judgeResult = renderedAnswerKeywordHit(task.platform, keywords) || judgeResult;
+  }
   runDebug.push({
     round: 0,
     type: "initial",
@@ -2430,6 +3043,9 @@ async function runPlatformTask(task) {
     lastPrompt = prompt;
     answerText = await waitAnswerStable(task, previousText);
     judgeResult = await judgeAnswer(answerText, keywords, task);
+    if (!judgeResult.matched) {
+      judgeResult = renderedAnswerKeywordHit(task.platform, keywords) || judgeResult;
+    }
     runDebug.push({
       round: followupCount,
       type: "followup",
@@ -2456,7 +3072,10 @@ async function runPlatformTask(task) {
   const finalAnswerText = await waitForFinalAnswerRender(task, answerText);
   if (normalizeKeywordText(finalAnswerText) !== normalizeKeywordText(answerText)) {
     answerText = finalAnswerText;
-    const finalJudge = await judgeAnswer(answerText, keywords, task);
+    let finalJudge = await judgeAnswer(answerText, keywords, task);
+    if (!finalJudge.matched) {
+      finalJudge = renderedAnswerKeywordHit(task.platform, keywords) || finalJudge;
+    }
     runDebug.push({
       round: followupCount,
       type: "final_stable_check",
@@ -2479,13 +3098,19 @@ async function runPlatformTask(task) {
     // 总是显示命中小标签，确保截图中能看到
     drawMatchedBadge(matchedKeywords);
 
-    // 尝试绘制红框，最多重试 2 轮
-    for (let attempt = 0; attempt < 2; attempt++) {
+    // 千问已经包含专用定位流程，只尝试一轮；其他平台保留一次兜底重试。
+    const locateAttempts = task.platform === "qianwen" ? 1 : 2;
+    for (let attempt = 0; attempt < locateAttempts; attempt++) {
       if (domLocation && domLocation.matched && visibleKeywordMarkExists() && keywordMarkFullyInViewport()) break;
 
       clearKeywordMarks();
-      // 先滚动到关键词位置；千问不要把整页回答容器滚回顶部，优先保持关键词搜索滚动结果。
-      if (task.platform !== "qianwen" && GEO_LAST_ANSWER_ELEMENT && document.body.contains(GEO_LAST_ANSWER_ELEMENT)) {
+      // 先滚动到关键词位置；千问也滚动到回答区域，确保虚拟滚动加载内容。
+      if (
+        GEO_LAST_ANSWER_ELEMENT &&
+        document.body.contains(GEO_LAST_ANSWER_ELEMENT) &&
+        !isIgnoredLocateNode(GEO_LAST_ANSWER_ELEMENT) &&
+        !isSidePanelKeywordNode(GEO_LAST_ANSWER_ELEMENT)
+      ) {
         GEO_LAST_ANSWER_ELEMENT.scrollIntoView({ block: "center", behavior: "instant" });
         await waitForScrollStable(2000);
       }
@@ -2501,10 +3126,12 @@ async function runPlatformTask(task) {
         if (task.platform === "qianwen") {
           scrollMatches = await findQianwenKeywordMatchesByScroll(keywordSearchTerms(matchedKeywords, judgeResult, keywords));
         } else {
-          scrollMatches = await findKeywordWithNativeFind(matchedKeywords.slice(0, 1), null);
-          if (!scrollMatches.length) {
-            scrollMatches = await findKeywordMatchesByScroll(matchedKeywords.slice(0, 1), null);
-          }
+          const answerRoot = GEO_LAST_ANSWER_ELEMENT && document.body.contains(GEO_LAST_ANSWER_ELEMENT)
+            ? GEO_LAST_ANSWER_ELEMENT
+            : null;
+          const exactTerms = keywordSearchTerms(matchedKeywords, judgeResult, keywords)
+            .sort((left, right) => normalizeKeywordText(right).length - normalizeKeywordText(left).length);
+          scrollMatches = await findKeywordMatchesByScroll(exactTerms, answerRoot);
         }
         if (scrollMatches.length) {
           const rects = task.platform === "qianwen"
@@ -2519,7 +3146,7 @@ async function runPlatformTask(task) {
               matched_keywords: [scrollMatches[0].keyword],
               rects: rects.map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height })),
               first_rect: { x: firstRect.x, y: firstRect.y, width: firstRect.width, height: firstRect.height },
-              needs_image_annotation: task.platform === "qianwen",
+              needs_image_annotation: false,
               match_type: task.platform === "qianwen" ? "qianwen_precise_keyword_scroll" : "scroll_fallback",
             };
           }
@@ -2529,12 +3156,12 @@ async function runPlatformTask(task) {
 
     // 等待渲染确保红框显示在屏幕上
     await new Promise((resolve) => requestAnimationFrame(resolve));
-    await sleep(task.platform === "qianwen" ? 900 : 500);
+    await sleep(task.platform === "qianwen" ? 300 : 500);
 
     // 如果网页层红框还是不可见，保留 domLocation，后面截图后会直接在图片上补框。
-    const imageFallbackRect = domLocation && domLocation.first_rect
+    const imageFallbackRect = domLocation && domLocation.matched && domLocation.first_rect
       ? domLocation.first_rect
-      : (task.platform === "qianwen" ? null : fallbackAnswerRect());
+      : null;
     if (!visibleKeywordMarkExists() || !keywordMarkFullyInViewport()) {
       clearKeywordMarks();
       if (imageFallbackRect) {
@@ -2544,27 +3171,69 @@ async function runPlatformTask(task) {
           matched_keywords: matchedKeywords,
           first_rect: imageFallbackRect,
           needs_image_annotation: true,
-          match_type: domLocation && domLocation.match_type ? domLocation.match_type : "answer_area_fallback",
+          match_type: domLocation && domLocation.match_type ? domLocation.match_type : "exact_keyword_canvas_fallback",
+        };
+      } else {
+        domLocation = {
+          matched: false,
+          matched_keywords: matchedKeywords,
+          first_rect: null,
+          needs_image_annotation: false,
+          match_type: "exact_keyword_not_found_no_box",
         };
       }
     }
   } else {
     clearKeywordMarks();
-    if (GEO_LAST_ANSWER_ELEMENT && document.body.contains(GEO_LAST_ANSWER_ELEMENT)) {
+    if (
+      GEO_LAST_ANSWER_ELEMENT &&
+      document.body.contains(GEO_LAST_ANSWER_ELEMENT) &&
+      !isIgnoredLocateNode(GEO_LAST_ANSWER_ELEMENT) &&
+      !isSidePanelKeywordNode(GEO_LAST_ANSWER_ELEMENT)
+    ) {
       GEO_LAST_ANSWER_ELEMENT.scrollIntoView({ block: "center", behavior: "smooth" });
       await waitForScrollStable();
     }
   }
 
   const shouldAnnotateImage = matched && domLocation && domLocation.first_rect && (
-    task.platform === "qianwen" ||
     domLocation.needs_image_annotation ||
     !visibleKeywordMarkExists() ||
     !keywordMarkFullyInViewport()
   );
-  const annotationRect = shouldAnnotateImage ? domLocation.first_rect : null;
+  let annotationRect = shouldAnnotateImage ? domLocation.first_rect : null;
+
+  if (domLocation && domLocation.matched) {
+    domLocation.screenshot_viewport = {
+      width: window.innerWidth,
+      height: window.innerHeight,
+      device_pixel_ratio: window.devicePixelRatio || 1,
+    };
+  }
 
   await prepareForScreenshot();
+  // 失焦、懒加载、吸顶栏和虚拟列表都可能在滚动结束后再次改变正文位置。
+  // 截图前必须以仍然存活的 Range 重新测量并重画，不能沿用滚动前坐标。
+  if (matched && GEO_ACTIVE_KEYWORD_RANGE && domLocation && domLocation.matched) {
+    const latestRect = await waitForKeywordRectStable(GEO_ACTIVE_KEYWORD_RANGE);
+    if (
+      latestRect && latestRect.x >= 0 && latestRect.y >= 0 &&
+      latestRect.x + latestRect.width <= window.innerWidth &&
+      latestRect.y + latestRect.height <= window.innerHeight
+    ) {
+      clearKeywordMarks();
+      drawBoxFromRect(latestRect, 4);
+      domLocation.first_rect = { ...latestRect };
+      domLocation.rects = [{ ...latestRect }];
+      if (shouldAnnotateImage) annotationRect = { ...latestRect };
+      domLocation.screenshot_viewport = {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        device_pixel_ratio: window.devicePixelRatio || 1,
+      };
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    }
+  }
   screenshotDataUrl = await captureVisibleScreenshot();
   cleanupAfterScreenshot();
   if (shouldAnnotateImage && screenshotDataUrl) {

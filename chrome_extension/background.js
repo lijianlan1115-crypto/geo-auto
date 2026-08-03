@@ -1,10 +1,113 @@
 let running = false;
 let activeCount = 0;
+let pumpActive = false;
 let currentServerUrl = "http://127.0.0.1:8765";
 let currentConcurrency = 3;
+const RUN_STATE_KEY = "geoAutomationRunning";
+const PUMP_ALARM_NAME = "geo-automation-pump";
+const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 
-const CONTENT_SCRIPTS = ["content_script.js", "content_script_geo_patch.js", "content_script_platform_patch.js"];
+const CONTENT_SCRIPTS = [
+  "content_script.js",
+  "content_script_geo_patch.js",
+  "content_script_platform_patch.js",
+  "content_script_qianwen_screenshot_patch.js",
+];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const lastDispatchByPlatform = {};
+const DEFAULT_RATE_LIMIT = {
+  enabled: true,
+  minDelaySec: 30,
+  maxDelaySec: 90,
+  samePlatformExtraSec: 15,
+};
+
+async function getRateLimitConfig() {
+  const data = await chrome.storage.local.get(["rateLimit"]);
+  const stored = data.rateLimit || {};
+  return {
+    enabled: stored.enabled !== undefined ? stored.enabled : DEFAULT_RATE_LIMIT.enabled,
+    minDelaySec: stored.minDelaySec || DEFAULT_RATE_LIMIT.minDelaySec,
+    maxDelaySec: stored.maxDelaySec || DEFAULT_RATE_LIMIT.maxDelaySec,
+    samePlatformExtraSec: stored.samePlatformExtraSec || DEFAULT_RATE_LIMIT.samePlatformExtraSec,
+  };
+}
+
+async function waitForPlatformCooldown(platform) {
+  const config = await getRateLimitConfig();
+  if (!config.enabled) return;
+  const lastTime = lastDispatchByPlatform[platform] || 0;
+  const now = Date.now();
+  const elapsed = now - lastTime;
+  const baseDelay = config.minDelaySec * 1000 + Math.random() * (config.maxDelaySec - config.minDelaySec) * 1000;
+  const extraDelay = config.samePlatformExtraSec * 1000;
+  const requiredDelay = baseDelay + extraDelay;
+  if (elapsed < requiredDelay) {
+    const waitMs = requiredDelay - elapsed;
+    const waitSec = Math.round(waitMs / 1000);
+    console.log(`[RATE-LIMIT] ${platform} cooling down, waiting ${waitSec}s...`);
+    try { chrome.runtime.sendMessage({ action: "STATUS_UPDATE", message: `等待 ${waitSec}s 再提问（防封号）...` }).catch(() => {}); } catch (e) {}
+    const startTime = Date.now();
+    while (Date.now() - startTime < waitMs) {
+      if (!running) return;
+      await sleep(1000);
+      // MV3 Service Worker 在长时间纯定时等待时会被休眠。周期性调用
+      // Chrome API 保持调度事件活跃，避免跑到一半丢失内存运行状态。
+      if (Math.floor((Date.now() - startTime) / 1000) % 10 === 0) {
+        await chrome.runtime.getPlatformInfo().catch(() => null);
+      }
+    }
+  }
+}
+
+async function setPersistentRunning(value) {
+  running = Boolean(value);
+  await chrome.storage.local.set({ [RUN_STATE_KEY]: running });
+  if (running) {
+    await chrome.alarms.create(PUMP_ALARM_NAME, { periodInMinutes: 0.5 });
+    await ensureOffscreenKeepalive().catch(() => null);
+  } else {
+    await chrome.alarms.clear(PUMP_ALARM_NAME).catch(() => false);
+    await closeOffscreenKeepalive().catch(() => null);
+  }
+}
+
+async function ensureOffscreenKeepalive() {
+  if (!chrome.offscreen || typeof chrome.offscreen.createDocument !== "function") return false;
+  const offscreenUrl = chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH);
+  if (typeof chrome.runtime.getContexts === "function") {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ["OFFSCREEN_DOCUMENT"],
+      documentUrls: [offscreenUrl],
+    });
+    if (contexts && contexts.length) return true;
+  }
+  try {
+    await chrome.offscreen.createDocument({
+      url: OFFSCREEN_DOCUMENT_PATH,
+      reasons: ["WORKERS"],
+      justification: "保持批量GEO任务调度，防止Chrome后台在任务中途休眠",
+    });
+    return true;
+  } catch (error) {
+    // 文档已存在时 createDocument 会报错，可视为保活已启用。
+    return /already exists|single offscreen/i.test(String(error && error.message ? error.message : error));
+  }
+}
+
+async function closeOffscreenKeepalive() {
+  if (!chrome.offscreen || typeof chrome.offscreen.closeDocument !== "function") return;
+  await chrome.offscreen.closeDocument().catch(() => null);
+}
+
+async function resumePumpFromPersistentState() {
+  const stored = await chrome.storage.local.get([RUN_STATE_KEY]);
+  if (!stored[RUN_STATE_KEY]) return;
+  await mergedSettingsFromStorage().catch(() => null);
+  running = true;
+  pump();
+}
 
 function splitKeywords(value) {
   if (Array.isArray(value)) return value.map((item) => String(item || "").trim()).filter(Boolean);
@@ -42,6 +145,17 @@ async function api(path, options = {}) {
   }
 }
 
+async function apiWithRetry(path, options = {}, attempts = 5) {
+  let lastResult = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    lastResult = await api(path, options);
+    if (lastResult && lastResult.ok) return lastResult;
+    await sleep(Math.min(5000, 800 * (attempt + 1)));
+    await chrome.runtime.getPlatformInfo().catch(() => null);
+  }
+  return lastResult || { ok: false, error: `${path} 多次重试仍未成功` };
+}
+
 async function waitForTabLoaded(tabId, timeoutMs = 60000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
@@ -75,12 +189,15 @@ async function effectiveTaskKeywords(task) {
   const data = await chrome.storage.local.get(["keyword"]);
   const taskKeywords = splitKeywords(task.keywords || task.keyword);
   const configuredKeywords = splitKeywords(data.keyword);
-  return configuredKeywords.length ? configuredKeywords : taskKeywords;
+  // Excel 每一行的目标关键词必须优先。面板关键词只在任务本身没有关键词时兜底，
+  // 否则不同问题会错误地用同一组全局关键词定位正文和截图。
+  return taskKeywords.length ? taskKeywords : configuredKeywords;
 }
 
 async function runOneTask(task) {
   let win = null;
   let tab = null;
+  let keepWindowOpen = false;
   try {
     const data = await chrome.storage.local.get(["platformUrls"]);
     const customUrl = data.platformUrls && data.platformUrls[task.platform];
@@ -128,6 +245,12 @@ async function runOneTask(task) {
     if (!result) {
       throw new Error("content script did not return result");
     }
+    if (
+      task.platform === "wenxin" &&
+      /文心.*(?:发送按钮|输入框未清空|避免重复发送)/.test(String(result.error || ""))
+    ) {
+      keepWindowOpen = true;
+    }
 
     if (!result.screenshot_data_url && tab && tab.windowId) {
       result.screenshot_data_url = await captureTabScreenshot(tab.windowId);
@@ -139,12 +262,13 @@ async function runOneTask(task) {
       throw err;
     }
 
-    await api("/submit-result", {
+    const submitted = await apiWithRetry("/submit-result", {
       method: "POST",
       body: JSON.stringify({
         task_id: task.task_id,
         row_number: task.row_number,
         row_id: task.row_id,
+        question: task.question,
         platform: task.platform,
         matched: Boolean(result && result.matched),
         matched_keywords: result && result.matched_keywords ? result.matched_keywords : [],
@@ -158,17 +282,27 @@ async function runOneTask(task) {
         keywords: task.keywords,
       }),
     });
+    if (!submitted || !submitted.ok) {
+      throw new Error(submitted && submitted.error ? submitted.error : "结果回传失败");
+    }
   } catch (error) {
+    if (
+      task.platform === "wenxin" &&
+      /文心.*(?:发送按钮|输入框未清空|避免重复发送)/.test(String(error && error.message ? error.message : error))
+    ) {
+      keepWindowOpen = true;
+    }
     let fallbackSubmitted = false;
     if (tab && tab.windowId) {
       const fallbackScreenshot = await captureTabScreenshot(tab.windowId).catch(() => null);
       if (fallbackScreenshot) {
-        const submitted = await api("/submit-result", {
+        const submitted = await apiWithRetry("/submit-result", {
           method: "POST",
           body: JSON.stringify({
             task_id: task.task_id,
             row_number: task.row_number,
             row_id: task.row_id,
+            question: task.question,
             platform: task.platform,
             matched: false,
             matched_keywords: [],
@@ -186,7 +320,7 @@ async function runOneTask(task) {
       }
     }
     if (fallbackSubmitted) return;
-    await api("/task-failed", {
+    await apiWithRetry("/task-failed", {
       method: "POST",
       body: JSON.stringify({
         task_id: task.task_id,
@@ -196,20 +330,22 @@ async function runOneTask(task) {
       }),
     }).catch(() => {});
   } finally {
-    activeCount -= 1;
-    if (win && win.id) {
+    activeCount = Math.max(0, activeCount - 1);
+    if (win && win.id && !keepWindowOpen) {
       await chrome.windows.remove(win.id).catch(() => {});
     }
-    pump();
   }
 }
 
 async function captureTabScreenshot(windowId) {
-  try {
-    return await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
-  } catch (e) {
-    return null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const screenshot = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+      if (screenshot) return screenshot;
+    } catch (e) {}
+    await sleep(250);
   }
+  return null;
 }
 
 async function testScreenshot(keywordText) {
@@ -284,25 +420,168 @@ async function getEffectiveConcurrency() {
   return Math.max(1, Math.min(5, Number(data.concurrency || currentConcurrency)));
 }
 
-async function pump() {
-  if (!running) return;
-  while (running) {
-    const effectiveConcurrency = await getEffectiveConcurrency();
-    if (activeCount >= effectiveConcurrency) {
-      await sleep(1000);
-      continue;
+async function collectOneTargetPlatformContext(platform, keywords) {
+  let win = null;
+  let tab = null;
+  try {
+    win = await createTaskWindow(platform.url);
+    if (!win || !win.id || !win.tabs || !win.tabs.length) {
+      throw new Error("无法创建目标预搜索窗口");
     }
-
-    const data = await api("/next-task");
-    if (!data.ok || !data.task) {
-      running = false;
-      return;
-    }
-    activeCount += 1;
-    runOneTask(data.task);
-    await sleep(1000);
+    tab = win.tabs[0];
+    await waitForTabLoaded(tab.id);
+    await sleep(2200);
+    await injectAutomationScripts(tab.id);
+    const scriptResult = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: async (payload) => {
+        if (typeof window.geoAutomationCollectTargetContext !== "function") {
+          return { ok: false, answer_text: "", error: "目标预搜索脚本未加载" };
+        }
+        return await window.geoAutomationCollectTargetContext(payload);
+      },
+      args: [{
+        platform: platform.key,
+        keywords,
+        answer_poll_interval: 0.8,
+        answer_stable_seconds: 3,
+        answer_final_settle_seconds: 5,
+        answer_timeout_seconds: 70,
+      }],
+    });
+    const result = scriptResult && scriptResult[0] ? scriptResult[0].result : null;
+    await api("/target-platform-context", {
+      method: "POST",
+      body: JSON.stringify({
+        keywords,
+        platform: platform.key,
+        ok: Boolean(result && result.ok),
+        answer_text: result && result.answer_text ? result.answer_text : "",
+        error: result && result.error ? result.error : "目标预搜索没有返回结果",
+      }),
+    });
+    return {
+      platform: platform.key,
+      ok: Boolean(result && result.ok),
+      error: result && result.error ? result.error : "",
+    };
+  } catch (error) {
+    await api("/target-platform-context", {
+      method: "POST",
+      body: JSON.stringify({
+        keywords,
+        platform: platform.key,
+        ok: false,
+        answer_text: "",
+        error: String(error && error.message ? error.message : error),
+      }),
+    }).catch(() => {});
+    return {
+      platform: platform.key,
+      ok: false,
+      error: String(error && error.message ? error.message : error),
+    };
+  } finally {
+    if (win && win.id) await chrome.windows.remove(win.id).catch(() => {});
   }
 }
+
+async function prewarmTargetContexts(platforms) {
+  const response = await api("/target-keyword-groups");
+  const groups = response && response.ok && Array.isArray(response.groups) ? response.groups : [];
+  const availablePlatforms = (platforms || []).filter((item) => item && item.key && item.url);
+  const results = [];
+
+  // Different target groups run one after another to avoid opening too many
+  // windows, while Doubao/Yuanbao/Qianwen for the same target run in parallel.
+  for (const group of groups) {
+    if (!running) break;
+    const keywords = Array.isArray(group.keywords) ? group.keywords.filter(Boolean) : [];
+    const cached = new Set(Array.isArray(group.cached_platforms) ? group.cached_platforms : []);
+    if (!keywords.length) continue;
+    const jobs = availablePlatforms
+      .filter((platform) => !cached.has(platform.key))
+      .map((platform) => collectOneTargetPlatformContext(platform, keywords));
+    if (jobs.length) results.push(...await Promise.all(jobs));
+  }
+
+  return {
+    groups: groups.length,
+    attempted: results.length,
+    succeeded: results.filter((item) => item.ok).length,
+    failed: results.filter((item) => !item.ok).length,
+  };
+}
+
+async function pump() {
+  if (!running || pumpActive) return;
+  pumpActive = true;
+  try {
+    while (running) {
+      const effectiveConcurrency = await getEffectiveConcurrency();
+      if (activeCount >= effectiveConcurrency) {
+        await sleep(100);
+        continue;
+      }
+
+      // 先查看平台并完成限流等待，再正式领取任务。以前先领取再等待，
+      // Service Worker 在等待期间被挂起时会遗留永久 running 任务。
+      const preview = await api("/peek-task");
+      if (!preview.ok) {
+        await sleep(2000);
+        continue;
+      }
+      if (!preview.task) {
+        if (activeCount > 0) {
+          await sleep(100);
+          continue;
+        }
+        // All windows have finished. Persist the final workbook first, then let
+        // the service clear this batch's temporary SQLite task records.
+        const finalized = await api("/finalize-batch", {
+          method: "POST",
+          body: JSON.stringify({}),
+        }).catch(() => {});
+        if (finalized && finalized.ok) {
+          await setPersistentRunning(false);
+          return;
+        }
+        // 仍有尚未回传的 running 任务时保持调度器存活，等待其完成；
+        // 不再把一次暂时无法收尾误判成整批结束。
+        await sleep(2000);
+        continue;
+      }
+
+      await waitForPlatformCooldown(preview.task.platform);
+      if (!running) return;
+
+      const data = await api("/next-task");
+      if (!data.ok) {
+        await sleep(2000);
+        continue;
+      }
+      // 预览后任务可能已被别的执行器领取，重新进入循环即可。
+      if (!data.task) continue;
+
+      lastDispatchByPlatform[data.task.platform] = Date.now();
+      activeCount += 1;
+      void runOneTask(data.task);
+      await sleep(50);
+    }
+  } finally {
+    pumpActive = false;
+  }
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm && alarm.name === PUMP_ALARM_NAME) {
+    void resumePumpFromPersistentState();
+  }
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  void resumePumpFromPersistentState();
+});
 
 async function syncRunConfig(platforms, aiJudge) {
   if (platforms && platforms.length) {
@@ -323,7 +602,7 @@ async function syncRunConfig(platforms, aiJudge) {
 }
 
 async function mergedSettingsFromStorage() {
-  const data = await chrome.storage.local.get(["serverUrl", "concurrency", "platformUrls", "platforms", "keyword", "aiJudge"]);
+  const data = await chrome.storage.local.get(["serverUrl", "concurrency", "platformUrls", "platforms", "keyword", "aiJudge", "rateLimit"]);
   currentServerUrl = data.serverUrl || currentServerUrl;
   const storedAiJudge = data.aiJudge || {};
   const serverAiJudge = await api("/ai-judge-config").catch(() => null);
@@ -338,11 +617,21 @@ async function mergedSettingsFromStorage() {
     } : {}),
     api_key: storedAiJudge.api_key || "",
   };
-  return { data, aiJudge };
+  const rateLimit = data.rateLimit || { enabled: true, minDelaySec: 30, maxDelaySec: 90, samePlatformExtraSec: 15 };
+  return { data, aiJudge, rateLimit };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
+    if (message.action === "GEO_KEEPALIVE") {
+      const stored = await chrome.storage.local.get([RUN_STATE_KEY]);
+      if (stored[RUN_STATE_KEY]) {
+        running = true;
+        pump();
+      }
+      sendResponse({ ok: true, running: Boolean(stored[RUN_STATE_KEY]) });
+      return;
+    }
     if (message.action === "CAPTURE_TAB") {
       if (!sender.tab || !sender.tab.windowId) {
         sendResponse({ ok: false, error: "找不到窗口" });
@@ -350,6 +639,135 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       const screenshotDataUrl = await captureTabScreenshot(sender.tab.windowId);
       sendResponse({ ok: Boolean(screenshotDataUrl), screenshotDataUrl });
+      return;
+    }
+
+    if (message.action === "WENXIN_CLICK_SEND_MAIN") {
+      if (!sender.tab || !sender.tab.id) {
+        sendResponse({ ok: false, error: "找不到文心标签页" });
+        return;
+      }
+      try {
+        const [{ result }] = await chrome.scripting.executeScript({
+          target: { tabId: sender.tab.id },
+          world: "MAIN",
+          func: () => {
+          const wrapper = Array.from(document.querySelectorAll(".ci-submit-button")).find((node) => {
+            const rect = node.getBoundingClientRect();
+            return rect.width > 8 && rect.height > 8 && node.querySelector("#ci-submit-button-ai");
+          });
+          if (!wrapper) return { ok: false, error: "主页面未找到 .ci-submit-button" };
+          const target = wrapper.querySelector("#ci-submit-button-ai") || wrapper;
+          target.focus?.();
+          const init = { bubbles: true, cancelable: true, composed: true, view: window, button: 0, buttons: 1 };
+          try {
+            target.dispatchEvent(new PointerEvent("pointerdown", { ...init, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+          } catch (e) {}
+          target.dispatchEvent(new MouseEvent("mousedown", init));
+          try {
+            target.dispatchEvent(new PointerEvent("pointerup", { ...init, buttons: 0, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+          } catch (e) {}
+          target.dispatchEvent(new MouseEvent("mouseup", { ...init, buttons: 0 }));
+          target.click();
+          return {
+            ok: true,
+            active: target.classList.contains("ci-submit-button-ai-active"),
+            target: target.id || target.className || target.tagName,
+          };
+          },
+        });
+        sendResponse(result || { ok: false, error: "文心主页面点击没有返回结果" });
+      } catch (error) {
+        sendResponse({ ok: false, error: String(error && error.message ? error.message : error) });
+      }
+      return;
+    }
+
+    if (message.action === "WENXIN_SET_INPUT_MAIN") {
+      if (!sender.tab || !sender.tab.id) {
+        sendResponse({ ok: false, error: "找不到文心标签页" });
+        return;
+      }
+      try {
+        const [{ result }] = await chrome.scripting.executeScript({
+          target: { tabId: sender.tab.id },
+          world: "MAIN",
+          args: [String(message.text || "")],
+          func: async (text) => {
+            const selectors = [
+              "#input-root textarea",
+              '#input-root [contenteditable="true"]',
+              '#input-root [contenteditable="plaintext-only"]',
+              "#chat-input-home textarea",
+              '#chat-input-home [contenteditable="true"]',
+              '#chat-input-home [contenteditable="plaintext-only"]',
+              ".ci-root textarea",
+              '.ci-root [contenteditable="true"]',
+              '.ci-root [contenteditable="plaintext-only"]',
+            ];
+            const candidates = [];
+            const seen = new Set();
+            for (const selector of selectors) {
+              for (const node of document.querySelectorAll(selector)) {
+                if (seen.has(node)) continue;
+                seen.add(node);
+                const rect = node.getBoundingClientRect();
+                if (rect.width < 80 || rect.height < 20 || node.disabled || node.getAttribute("aria-disabled") === "true") continue;
+                let score = rect.top + Math.min(rect.width, 1200);
+                if (node.closest("#input-root")) score += 5000;
+                if (node.closest(".ci-root")) score += 3000;
+                candidates.push({ node, score });
+              }
+            }
+            candidates.sort((a, b) => b.score - a.score);
+            const input = candidates[0] && candidates[0].node;
+            if (!input) return { ok: false, error: "主页面未找到 #input-root 内的真实编辑框" };
+
+            input.focus();
+            if (input.isContentEditable) {
+              const selection = window.getSelection();
+              const range = document.createRange();
+              range.selectNodeContents(input);
+              selection.removeAllRanges();
+              selection.addRange(range);
+              let inserted = false;
+              try {
+                inserted = document.execCommand("insertText", false, text);
+              } catch (e) {}
+              if (!inserted || String(input.textContent || "").trim() !== text.trim()) {
+                input.textContent = text;
+              }
+            } else {
+              const proto = input instanceof HTMLTextAreaElement
+                ? HTMLTextAreaElement.prototype
+                : HTMLInputElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+              if (setter) setter.call(input, text);
+              else input.value = text;
+            }
+            input.dispatchEvent(new InputEvent("input", {
+              bubbles: true,
+              composed: true,
+              inputType: "insertText",
+              data: text,
+            }));
+            input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+            await new Promise((resolve) => setTimeout(resolve, 180));
+            const actual = String(input.isContentEditable ? input.textContent : input.value || "").trim();
+            return {
+              ok: actual === text.trim(),
+              error: actual === text.trim() ? "" : "写入后文本校验不一致",
+              actual_length: actual.length,
+              expected_length: text.trim().length,
+              tag: input.tagName,
+              class_name: String(input.className || ""),
+            };
+          },
+        });
+        sendResponse(result || { ok: false, error: "文心主页面写入没有返回结果" });
+      } catch (error) {
+        sendResponse({ ok: false, error: String(error && error.message ? error.message : error) });
+      }
       return;
     }
 
@@ -375,6 +793,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           question: message.question || "",
           platform: message.platform || "",
           followup_count: message.followup_count || 0,
+          task_id: message.task_id || (message.question && message.question.task_id) || "",
         }),
       }));
       return;
@@ -396,6 +815,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         platformUrls: data.platformUrls || {},
         platforms: data.platforms || [],
         aiJudge,
+        rateLimit: data.rateLimit || { enabled: true, minDelaySec: 30, maxDelaySec: 90, samePlatformExtraSec: 15 },
       });
       return;
     }
@@ -417,6 +837,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         platformUrls: message.platformUrls || {},
         platforms: message.platforms || [],
         aiJudge: nextAiJudge,
+        rateLimit: message.rateLimit || { enabled: true, minDelaySec: 30, maxDelaySec: 90, samePlatformExtraSec: 15 },
       });
       const synced = await syncRunConfig(message.platforms || [], message.aiJudge ? { ...message.aiJudge, api_key: message.aiJudge.api_key || "" } : undefined).catch((error) => ({
         ok: false,
@@ -458,6 +879,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
         return;
       }
+      const excelSync = await api("/sync-results", {
+        method: "POST",
+        body: JSON.stringify({ reason: "before_start" }),
+      }).catch((error) => ({
+        ok: false,
+        error: String(error && error.message ? error.message : error),
+      }));
+      if (!excelSync || !excelSync.ok) {
+        sendResponse({
+          ok: false,
+          running: false,
+          message: `插件配置已保存，但结果 Excel 准备失败：${excelSync && excelSync.error ? excelSync.error : "未知错误"}`,
+        });
+        return;
+      }
       await api("/reset-running-tasks", { method: "POST", body: JSON.stringify({}) }).catch(() => {});
       const health = await api("/health").catch(() => null);
       if (!health || !health.ok) {
@@ -479,21 +915,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
         return;
       }
-      running = true;
+      await setPersistentRunning(true);
+      const targetWarmup = await prewarmTargetContexts(message.platforms || []).catch((error) => ({
+        groups: 0,
+        attempted: 0,
+        succeeded: 0,
+        failed: 0,
+        error: String(error && error.message ? error.message : error),
+      }));
+      if (!running) {
+        sendResponse({ ok: true, running: false, message: "已停止；目标预搜索结果已保留供下次继续。", target_warmup: targetWarmup });
+        return;
+      }
       pump();
       const stats = health && health.stats ? health.stats : {};
       sendResponse({
         ok: true,
         running,
         concurrency: currentConcurrency,
-        message: `已开始 / 继续执行：已完成 ${Number(stats.done || 0)}，待执行 ${Number(stats.pending || 0)}，失败 ${Number(stats.failed || 0)}。`,
+        message: `目标预搜索完成（成功 ${Number(targetWarmup.succeeded || 0)}/${Number(targetWarmup.attempted || 0)}），已开始执行：已完成 ${Number(stats.done || 0)}，待执行 ${Number(stats.pending || 0)}，失败 ${Number(stats.failed || 0)}。`,
         stats,
+        target_warmup: targetWarmup,
       });
       return;
     }
 
     if (message.action === "RESET_FAILED_TASKS") {
       sendResponse(await api("/reset-failed-tasks", { method: "POST", body: JSON.stringify({}) }));
+      return;
+    }
+
+    if (message.action === "RESET_QIANWEN_UNMATCHED") {
+      sendResponse(await api("/reset-unmatched-tasks", {
+        method: "POST",
+        body: JSON.stringify({ platform: "qianwen" }),
+      }));
       return;
     }
 
@@ -508,8 +964,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.action === "STOP") {
-      running = false;
-      sendResponse({ ok: true, running });
+      await setPersistentRunning(false);
+      const syncResult = await api("/sync-results", {
+        method: "POST",
+        body: JSON.stringify({ reason: "manual_stop" }),
+      }).catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }));
+      sendResponse({
+        ok: Boolean(syncResult && syncResult.ok),
+        running,
+        synced: Boolean(syncResult && syncResult.synced),
+        result_excel: syncResult && syncResult.result_excel ? syncResult.result_excel : "",
+        message: syncResult && syncResult.ok
+          ? "已停止，并已把已完成截图补写到结果 Excel"
+          : `已停止；Excel 暂未写入：${syncResult && syncResult.error ? syncResult.error : "请关闭 Excel/WPS 后重启服务补写"}`,
+      });
       return;
     }
 

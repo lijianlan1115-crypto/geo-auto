@@ -97,6 +97,9 @@ class DesktopApp:
         # 后续启动读取 settings.json，继续使用同一个结果文件以支持断点续跑。
         if not DESKTOP_SETTINGS.get("result_excel"):
             service_server.configure_output_dir(service_config.OUTPUT_DIR)
+        else:
+            service_server.init_db()
+            service_server.bind_result_excel_to_progress()
 
         self.input_excel = Path(service_config.INPUT_EXCEL)
         self.output_dir = Path(service_config.OUTPUT_DIR)
@@ -483,6 +486,10 @@ class DesktopApp:
             return
 
         def stop():
+            try:
+                service_server.sync_result_from_db()
+            except Exception as exc:
+                print(f"停止服务前同步结果失败：{exc}")
             server.shutdown()
             server.server_close()
             self.http_server = None
@@ -561,13 +568,22 @@ class DesktopApp:
     def validate_input_excel(self, path):
         from openpyxl import load_workbook
 
-        workbook = load_workbook(path, read_only=True, data_only=True)
+        workbook = load_workbook(
+            path,
+            read_only=False,
+            data_only=True,
+            keep_links=False,
+        )
 
         try:
-            worksheet = workbook.active
+            # WPS 的多 Sheet 文件有时会留下越界的 activeTab 索引，直接访问
+            # workbook.active 会报 tuple/list index out of range。输入校验必须
+            # 与服务端一致，扫描所有 Sheet 找到真正包含“问题”列的数据表。
+            worksheet = service_server.find_question_worksheet(workbook)
+            first_row = next(worksheet.iter_rows(min_row=1, max_row=1), ())
             headers = {
                 str(cell.value).strip()
-                for cell in worksheet[1]
+                for cell in first_row
                 if cell.value is not None and str(cell.value).strip()
             }
         finally:

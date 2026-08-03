@@ -1,6 +1,6 @@
 const DEFAULT_PLATFORM_URLS = {
   doubao: "https://www.doubao.com/chat/",
-  qianwen: "https://tongyi.aliyun.com/qianwen/",
+  qianwen: "https://www.qianwen.com/",
   deepseek: "https://chat.deepseek.com/",
   yuanbao: "https://yuanbao.tencent.com/chat/",
   wenxin: "https://chat.baidu.com/?enter_type=yiyan_site",
@@ -21,6 +21,10 @@ const aiJudgeEnabledInput = document.getElementById("aiJudgeEnabled");
 const aiJudgeApiUrlInput = document.getElementById("aiJudgeApiUrl");
 const aiJudgeModelInput = document.getElementById("aiJudgeModel");
 const aiJudgeApiKeyInput = document.getElementById("aiJudgeApiKey");
+const rateLimitEnabledInput = document.getElementById("rateLimitEnabled");
+const rateLimitMinInput = document.getElementById("rateLimitMin");
+const rateLimitMaxInput = document.getElementById("rateLimitMax");
+const rateLimitExtraInput = document.getElementById("rateLimitExtra");
 const platformsEl = document.getElementById("platforms");
 const logEl = document.getElementById("log");
 const serviceBadgeEl = document.getElementById("serviceBadge");
@@ -148,7 +152,13 @@ function readForm() {
     model: aiJudgeModelInput.value.trim(),
     api_key: aiJudgeApiKeyInput.value.trim(),
   };
-  return { serverUrl, concurrency, keyword, platforms, platformUrls, aiJudge };
+  const rateLimit = {
+    enabled: rateLimitEnabledInput.checked,
+    minDelaySec: Math.max(5, Number(rateLimitMinInput.value || 30)),
+    maxDelaySec: Math.max(10, Number(rateLimitMaxInput.value || 90)),
+    samePlatformExtraSec: Math.max(0, Number(rateLimitExtraInput.value || 15)),
+  };
+  return { serverUrl, concurrency, keyword, platforms, platformUrls, aiJudge, rateLimit };
 }
 
 function normalizePlatformRows() {
@@ -246,6 +256,14 @@ platformsEl.addEventListener("click", (event) => {
 document.getElementById("reloadPage").addEventListener("click", async () => log(await send("RELOAD_ACTIVE_TAB")));
 document.getElementById("reloadExtension").addEventListener("click", async () => log(await send("RELOAD_EXTENSION")));
 document.getElementById("resetFailed").addEventListener("click", async () => log(await send("RESET_FAILED_TASKS")));
+document.getElementById("resetQianwenUnmatched").addEventListener("click", async () => {
+  const saved = await saveSettings();
+  if (!saved || !saved.ok) {
+    log(saved || { ok: false, error: "保存配置失败" });
+    return;
+  }
+  log(await send("RESET_QIANWEN_UNMATCHED"));
+});
 document.getElementById("resetAll").addEventListener("click", async () => {
   const saved = await saveSettings();
   if (!saved || !saved.ok) {
@@ -294,6 +312,11 @@ send("GET_SETTINGS").then((data) => {
   aiJudgeApiKeyInput.placeholder = aiJudge.has_api_key
     ? `已保存 ${aiJudge.api_key_preview || ""}，不修改可留空`
     : "只保存在本机 Chrome 配置和本地服务";
+  const rateLimit = data.rateLimit || {};
+  rateLimitEnabledInput.checked = rateLimit.enabled !== undefined ? rateLimit.enabled : true;
+  rateLimitMinInput.value = rateLimit.minDelaySec || 30;
+  rateLimitMaxInput.value = rateLimit.maxDelaySec || 90;
+  rateLimitExtraInput.value = rateLimit.samePlatformExtraSec || 15;
   if (data.platforms && data.platforms.length) {
     renderPlatforms(data.platforms);
   } else if (data.platformUrls && Object.keys(data.platformUrls).length) {
@@ -304,7 +327,7 @@ send("GET_SETTINGS").then((data) => {
   normalizePlatformRows();
   setServiceBadge("", "服务未检查");
 }).catch(() => {
-  chrome.storage.local.get(["serverUrl", "concurrency", "keyword", "platforms", "platformUrls", "aiJudge"], (data) => {
+  chrome.storage.local.get(["serverUrl", "concurrency", "keyword", "platforms", "platformUrls", "aiJudge", "rateLimit"], (data) => {
     if (data.serverUrl) serverUrlInput.value = data.serverUrl;
     if (data.concurrency) concurrencyInput.value = data.concurrency;
     if (data.keyword) keywordInput.value = data.keyword;
@@ -313,6 +336,11 @@ send("GET_SETTINGS").then((data) => {
     aiJudgeApiUrlInput.value = aiJudge.api_url || "";
     aiJudgeModelInput.value = aiJudge.model || "";
     aiJudgeApiKeyInput.value = aiJudge.api_key || "";
+    const rateLimit = data.rateLimit || {};
+    rateLimitEnabledInput.checked = rateLimit.enabled !== undefined ? rateLimit.enabled : true;
+    rateLimitMinInput.value = rateLimit.minDelaySec || 30;
+    rateLimitMaxInput.value = rateLimit.maxDelaySec || 90;
+    rateLimitExtraInput.value = rateLimit.samePlatformExtraSec || 15;
     if (data.platforms && data.platforms.length) {
       renderPlatforms(data.platforms);
     } else if (data.platformUrls && Object.keys(data.platformUrls).length) {

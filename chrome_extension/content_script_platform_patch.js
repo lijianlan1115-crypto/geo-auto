@@ -243,18 +243,9 @@
     const originalRun = window.geoAutomationRun;
     window.geoAutomationRun = async function geoAutomationRunWithPlatformNormalize(task) {
       const normalizedTask = normalizeTaskPlatform(task);
-      const result = await originalRun(normalizedTask);
-      try {
-        return await recaptureQianwenScreenshot(normalizedTask, result);
-      } catch (error) {
-        const runDebug = Array.isArray(result && result.run_debug) ? [...result.run_debug] : [];
-        runDebug.push({
-          type: "qianwen_screenshot_recapture",
-          ok: false,
-          reason: String(error && error.message ? error.message : error),
-        });
-        return result ? { ...result, run_debug: runDebug } : result;
-      }
+      // 正文定位、拉框和截图已经由主流程一次完成。这里仅负责平台归一化，
+      // 不再对千问执行第二次全页搜索和截图。
+      return await originalRun(normalizedTask);
     };
     window.__geoPlatformPatchWrapped = true;
   }
