@@ -129,9 +129,20 @@ jobs:
               throw "Packaged EXE did not expose a healthy local service"
             }
           } finally {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            & taskkill.exe /PID $process.Id /T /F 2>$null | Out-Null
+            Wait-Process -Id $process.Id -Timeout 15 -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
             Remove-Item "$package/input.xlsx" -Force -ErrorAction SilentlyContinue
-            Remove-Item "$package/output" -Recurse -Force -ErrorAction SilentlyContinue
+            foreach ($cleanupAttempt in 1..10) {
+              if (-not (Test-Path "$package/output")) { break }
+              try {
+                Remove-Item "$package/output" -Recurse -Force -ErrorAction Stop
+                break
+              } catch {
+                if ($cleanupAttempt -eq 10) { throw }
+                Start-Sleep -Seconds 1
+              }
+            }
           }
 
       - name: Create verified ZIP and checksum
